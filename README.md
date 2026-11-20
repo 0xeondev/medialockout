@@ -179,7 +179,7 @@ Media Lockout is at its first transmission. Many new things are planned and will
 
 | Path | What it is |
 |---|---|
-| `site/index.html` | The site. It matches the live page byte for byte as of 20 November 2026. |
+| `site/index.html` | The site: a single self-contained page. |
 | `docs/` | Images used in this README. |
 
 ### Preview locally
@@ -188,7 +188,7 @@ Open `site/index.html` in a browser. There is nothing to install.
 
 ### Deploy
 
-The site runs on a Cloudflare Worker that is currently edited in the Cloudflare dashboard. This repository is the source of record for the page; it does not deploy by itself yet.
+The site is served by a Cloudflare Worker. This repository is the source of record for the page.
 
 ## Team
 
