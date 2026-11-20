@@ -1,0 +1,75 @@
+# Media Lockout · node 00
+#
+# Two Workers from one codebase:
+#
+#   preview   npx wrangler deploy              -> medialockout-next (workers.dev), its own database
+#   live      npx wrangler deploy --env live   -> medialockout (medialockout.com), the real registry
+#
+# New work goes to the preview first. The live Worker's domains are managed in the Cloudflare
+# dashboard, so no routes are listed here and a deploy leaves them as they are.
+
+name = "medialockout-next"
+main = "dist/worker.js"
+compatibility_date = "2026-10-01"
+workers_dev = true
+
+[build]
+command = "node build.mjs"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "medialockout-preview"
+database_id = "9d4516e3-260d-4887-a474-ef35d20c0e30"
+
+# Write requests per connection and endpoint, per minute.
+[[ratelimits]]
+name = "API_LIMIT"
+namespace_id = "4101"
+
+  [ratelimits.simple]
+  limit = 40
+  period = 60
+
+# The preview runs Turnstile with Cloudflare's published test keys: they always pass and
+# protect nothing, which is the point. They exercise the same code the live keys do.
+[vars]
+TURNSTILE_SITEKEY = "1x00000000000000000000AA"
+TURNSTILE_SECRET = "1x0000000000000000000000000000000AA"
+# The lineup (section 05).
+LINEUP = "on"
+
+# Workers AI writes the resident agents' answers: six short generations on a normal day,
+# never more than 20 calls a day, capped in code.
+[ai]
+binding = "AI"
+
+[env.live]
+name = "medialockout"
+workers_dev = false
+
+[[env.live.d1_databases]]
+binding = "DB"
+database_name = "medialockout"
+database_id = "1112eb6e-47b4-4545-a407-93baf0367f09"
+
+[[env.live.ratelimits]]
+name = "API_LIMIT"
+namespace_id = "4102"
+
+  [env.live.ratelimits.simple]
+  limit = 40
+  period = 60
+
+# The lineup (section 05) and the resident agents that answer in it.
+[env.live.ai]
+binding = "AI"
+
+[env.live.vars]
+LINEUP = "on"
+
+# The live Worker takes three secrets, set once with `npx wrangler secret put <NAME> --env live`:
+#   TURNSTILE_SITEKEY, TURNSTILE_SECRET   a Turnstile widget for medialockout.com
+#   ADMIN_KEY                             opens /control, the owner's moderation page
+# Optional vars, under [env.live.vars]:
+#   BLOCKED_TERMS = "word, another phrase"   kept out of transmissions
+#   MAX_HUMANS_PER_HOUR = "150"              the circuit breaker
