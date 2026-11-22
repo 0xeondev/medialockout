@@ -359,11 +359,32 @@
     meta.appendChild(ageNode(visit.at));
     var foot = el('div', 'ml-human-foot');
     foot.appendChild(el('span', null, 'real request'));
+    if (visit.node) foot.appendChild(el('span', null, 'at ' + nodeLabel(visit.node.id)));
     foot.appendChild(el('span', 'ml-agent-kind', refused ? 'refused' : visit.kind));
     body.appendChild(meta);
     body.appendChild(el('p', 'ml-agent-text', refused
       ? 'tried to open the human channel'
-      : (VERBS[visit.kind] || 'requested') + ' ' + (visit.path || 'a path that does not exist')));
+      : (VERBS[visit.kind] || 'requested') + ' ' + (visit.node ? visit.node.host : visit.path || 'a path that does not exist')));
+    body.appendChild(foot);
+    post.appendChild(mark);
+    post.appendChild(body);
+    return post;
+  }
+
+  // A site a counted human has vouched for, from the moment its line was found there.
+  function nodeEntry(item) {
+    var post = el('article', 'ml-human');
+    var mark = el('span', 'ml-human-mark');
+    mark.setAttribute('aria-hidden', 'true');
+    var body = el('div', 'ml-human-body');
+    var meta = el('div', 'ml-human-meta');
+    meta.appendChild(el('b', null, nodeLabel(item.id)));
+    meta.appendChild(ageNode(item.at));
+    var foot = el('div', 'ml-human-foot');
+    foot.appendChild(el('span', null, 'new node'));
+    foot.appendChild(el('span', null, 'opened by human ' + pad(item.n)));
+    body.appendChild(meta);
+    body.appendChild(el('p', 'ml-human-text', item.host + ' began counting its machines'));
     body.appendChild(foot);
     post.appendChild(mark);
     post.appendChild(body);
@@ -373,7 +394,9 @@
   // The feed is the node's own record, newest first. Nothing is scripted and nothing repeats.
   function renderFeed(events) {
     if (!feedEl) return;
-    var keys = events.map(function (e) { return e.t === 'human' ? 'h' + e.id + ':' + e.at : 'a' + e.name + ':' + e.at; });
+    var keys = events.map(function (e) {
+      return e.t === 'human' ? 'h' + e.id + ':' + e.at : e.t === 'node' ? 'n' + e.id + ':' + e.at : 'a' + e.name + (e.node ? '@' + e.node.id : '') + ':' + e.at;
+    });
     var key = keys.join('|') + (me && known ? '+' + me.human.n : '');
     if (key === feedKey) return;
     var first = feedKey === null;
@@ -385,7 +408,7 @@
       return;
     }
     events.forEach(function (e, i) {
-      var node = e.t === 'human' ? humanPost(e) : agentEntry(e);
+      var node = e.t === 'human' ? humanPost(e) : e.t === 'node' ? nodeEntry(e) : agentEntry(e);
       if (!first && !feedSeen[keys[i]]) node.classList.add('ml-new');
       feedEl.appendChild(node);
     });
@@ -412,6 +435,19 @@
       lineupOn = true;
       lineupEl.hidden = false;
       loadLineup();
+    }
+    if (next.net && netEl) {
+      var seen = next.net.nodes + ':' + next.net.machines + ':' + next.net.browsers;
+      if (!netOn) {
+        netOn = true;
+        netEl.hidden = false;
+        netSeen = seen;
+        loadNet();
+      } else if (seen !== netSeen) {
+        netSeen = seen;
+        // The count moved. Redraw, unless the human is in the middle of typing here.
+        if (!netBody.contains(document.activeElement)) loadNet();
+      }
     }
     renderFeed(next.events || []);
     tick();
@@ -1148,6 +1184,7 @@
         feedKey = null;
         applyState(res.state);
         loadLineup();
+        loadNet();
         if (ch) viewResult(res);
       }, function (error) {
         if (!ch) return;
@@ -1407,6 +1444,230 @@
     lineupBody.appendChild(cols);
   }
 
+  /* ---------- 06: the network ---------- */
+
+  var netEl = $('ml-net');
+  var netBody = $('ml-net-body');
+  var netOn = false;
+  var net = null;            // { nodes, totals, mine, limit }
+  var netSeen = '';
+  var netSaid = null;        // { text, tone }: the answer to the last thing asked of the network
+
+  function nodeLabel(id) { return 'node ' + (id < 10 ? '0' : '') + id; }
+  function figure(n) { return Number(n || 0).toLocaleString('en-US'); }
+
+  function loadNet() {
+    if (!netOn || !netBody) return;
+    api('/api/nodes', me && known ? { token: me.token } : undefined).then(function (data) {
+      net = data;
+      renderNet();
+    }, function () {});
+  }
+
+  function takeNet(res, said) {
+    if (res.mine) net.mine = res.mine;
+    if (res.nodes) net.nodes = res.nodes;
+    if (res.totals) net.totals = res.totals;
+    netSaid = said || null;
+    renderNet();
+    refresh();
+  }
+
+  function copyText(text, field) {
+    if (navigator.clipboard && navigator.clipboard.writeText) return navigator.clipboard.writeText(text);
+    return new Promise(function (done, failed) {
+      field.focus();
+      field.select();
+      try { if (document.execCommand('copy')) done(); else failed(); } catch (e) { failed(); }
+    });
+  }
+
+  // One of the sites this human has opened: its line while it waits, its count once it is listed.
+  function myNode(node) {
+    var box = el('div', 'ml-net-mine');
+    var head = el('div', 'ml-net-host');
+    head.appendChild(el('span', null, node.host));
+    head.appendChild(el('small', node.verified_at ? 'on' : null, node.verified_at ? nodeLabel(node.id) + ' · counting' : 'waiting for its line'));
+    box.appendChild(head);
+
+    var status = el('p', 'ml-note');
+    status.setAttribute('role', 'status');
+    var tag = el('textarea', 'ml-net-tag');
+    tag.readOnly = true;
+    tag.rows = 3;
+    tag.value = node.tag;
+    tag.spellcheck = false;
+    tag.setAttribute('aria-label', 'The line for ' + node.host);
+    tag.addEventListener('focus', function () { tag.select(); });
+    var row = el('div', 'ml-net-row');
+
+    var copy = el('button', 'ml-btn', 'Copy the line');
+    copy.type = 'button';
+    copy.addEventListener('click', function () {
+      copyText(node.tag, tag).then(function () { copy.textContent = 'Copied'; }, function () { copy.textContent = 'Select it and copy'; });
+    });
+
+    if (!node.verified_at) {
+      box.appendChild(el('p', 'ml-note', 'Place this line anywhere in the body of the front page of ' + node.host + ', then check the site. It draws a small badge there, and it is how the machines that read the site are counted. A site that builds its pages in the browser can instead keep the key ' + node.key + ' in a file named lockout.txt at its root. If the site sends a Content-Security-Policy, allow ' + location.origin + ' under script-src and img-src.'));
+      box.appendChild(tag);
+      var check = el('button', 'ml-btn ml-btn-solid', 'Check the site');
+      check.type = 'button';
+      check.addEventListener('click', function () {
+        check.disabled = true;
+        status.className = 'ml-note';
+        status.textContent = 'Reading ' + node.host + '...';
+        api('/api/node/check', { token: me.token, id: node.id }).then(function (res) {
+          takeNet(res, res.warn
+            ? { text: node.host + ' is ' + nodeLabel(node.id) + ', but ' + res.warn, tone: 'r' }
+            : { text: node.host + ' is ' + nodeLabel(node.id) + '. It is counting.', tone: 'w' });
+        }, function (error) {
+          check.disabled = false;
+          status.className = 'ml-note r';
+          status.textContent = error.message;
+        });
+      });
+      row.appendChild(copy);
+      row.appendChild(check);
+    } else {
+      status.textContent = node.last_seen ? 'Last request counted ' + ago(now() - node.last_seen) + ' ago.' : 'Listed. Nothing has been counted there yet.';
+      var see = el('a', 'ml-btn', 'See the node');
+      see.href = '/n/' + node.id;
+      var show = el('button', 'ml-btn', 'Show the line');
+      show.type = 'button';
+      tag.hidden = true;
+      show.addEventListener('click', function () {
+        tag.hidden = !tag.hidden;
+        show.textContent = tag.hidden ? 'Show the line' : 'Hide the line';
+      });
+      var again = el('button', 'ml-btn', 'Check the line');
+      again.type = 'button';
+      again.addEventListener('click', function () {
+        again.disabled = true;
+        status.className = 'ml-note';
+        status.textContent = 'Reading ' + node.host + '...';
+        api('/api/node/check', { token: me.token, id: node.id }).then(function (res) {
+          again.disabled = false;
+          status.className = 'ml-note' + (res.warn ? ' r' : '');
+          status.textContent = res.warn ? res.warn : 'The line is on the front page, and browsers can load it.';
+        }, function (error) {
+          again.disabled = false;
+          status.className = 'ml-note r';
+          status.textContent = error.message;
+        });
+      });
+      box.appendChild(tag);
+      row.appendChild(see);
+      row.appendChild(show);
+      row.appendChild(again);
+    }
+
+    var close = el('button', 'ml-btn ml-btn-quiet', 'Close node');
+    close.type = 'button';
+    close.addEventListener('click', function () {
+      if (close.textContent !== 'Sure? Its count is erased') { close.textContent = 'Sure? Its count is erased'; return; }
+      close.disabled = true;
+      api('/api/node/close', { token: me.token, id: node.id }).then(function (res) {
+        takeNet(res, { text: node.host + ' is closed. Its count is erased.', tone: '' });
+      }, function (error) {
+        close.disabled = false;
+        status.className = 'ml-note r';
+        status.textContent = error.message;
+      });
+    });
+    row.appendChild(close);
+    box.appendChild(row);
+    box.appendChild(status);
+    return box;
+  }
+
+  function renderNet() {
+    if (!net || !netBody) return;
+    var counted = !!(me && known);
+    var mine = (counted && net.mine) || [];
+    var limit = net.limit || 3;
+    netBody.textContent = '';
+
+    netBody.appendChild(el('p', 'ml-lede', 'Any site can become a node. It carries one line of markup, and every machine that reads the site is counted here by the name it gives. Nothing about its visitors is kept. Only a counted human can open a node.'));
+
+    var figs = el('div', 'ml-net-figs');
+    [['Nodes beyond this one', net.totals.nodes], ['Machines counted there', net.totals.machines], ['Browsers seen there', net.totals.browsers]].forEach(function (f) {
+      var cell = el('div');
+      cell.appendChild(el('span', null, f[0]));
+      cell.appendChild(el('b', null, figure(f[1])));
+      figs.appendChild(cell);
+    });
+    netBody.appendChild(figs);
+
+    var listed = panel('The nodes');
+    if (!net.nodes.length) {
+      listed.appendChild(el('p', 'ml-note', 'No site has joined yet. Node 00 is counting alone.'));
+    } else {
+      var list = el('ul', 'ml-net-list');
+      net.nodes.forEach(function (node) {
+        var li = el('li');
+        var link = el('a');
+        link.href = '/n/' + node.id;
+        link.appendChild(el('small', null, nodeLabel(node.id)));
+        link.appendChild(document.createTextNode(node.host));
+        li.appendChild(link);
+        li.appendChild(el('span', null, plural(node.machines, 'machine', 'machines').replace(String(node.machines), figure(node.machines)) + ' · kept by ' + pad(node.n)));
+        list.appendChild(li);
+      });
+      listed.appendChild(list);
+    }
+    netBody.appendChild(listed);
+
+    var own = panel(counted ? 'Your nodes' : 'Open a node');
+    if (!counted) {
+      own.appendChild(el('p', 'ml-note', 'A node is a human vouching for a site. Be counted first, then name the site.'));
+      var row = el('div', 'ml-net-row');
+      var go = el('button', 'ml-btn', 'Open the channel');
+      go.type = 'button';
+      go.addEventListener('click', openChannel);
+      row.appendChild(go);
+      own.appendChild(row);
+    } else {
+      mine.forEach(function (node) { own.appendChild(myNode(node)); });
+      var said = el('p', 'ml-note' + (netSaid && netSaid.tone === 'r' ? ' r' : ''), netSaid ? netSaid.text : '');
+      said.setAttribute('role', 'status');
+      if (mine.length < limit) {
+        var form = el('form', 'ml-net-open' + (mine.length ? ' more' : ''));
+        var field = el('input', 'ml-field');
+        field.type = 'text';
+        field.name = 'host';
+        field.placeholder = 'example.com';
+        field.maxLength = 120;
+        field.autocomplete = 'off';
+        field.autocapitalize = 'off';
+        field.spellcheck = false;
+        field.setAttribute('aria-label', 'The address of a site you can edit');
+        var send = el('button', 'ml-btn', 'Open a node');
+        send.type = 'submit';
+        form.appendChild(field);
+        form.appendChild(send);
+        form.addEventListener('submit', function (event) {
+          event.preventDefault();
+          var host = field.value.trim();
+          if (!host) return;
+          send.disabled = true;
+          api('/api/node/open', { token: me.token, host: host }).then(function (res) {
+            takeNet(res, { text: res.host + ' is waiting for its line.', tone: '' });
+          }, function (error) {
+            send.disabled = false;
+            said.className = 'ml-note r';
+            said.textContent = error.message;
+          });
+        });
+        own.appendChild(form);
+        if (!mine.length && !netSaid) said.textContent = 'Name a site you can edit. Up to ' + limit + ' nodes to a human.';
+      } else if (!netSaid) {
+        said.textContent = limit + ' nodes to a human. Close one to open another.';
+      }
+      own.appendChild(said);
+    }
+    netBody.appendChild(own);
+  }
+
   /* ---------- the diagnostics terminal ---------- */
 
   var term = $('ml-term');
@@ -1443,6 +1704,7 @@
         '  signal                     read the human signal',
         '  agents                     who else is on this node',
         '  lineup                     go to the lineup',
+        '  nodes                      the sites that keep count with this one',
         '  whoami                     what this node thinks you are',
         '  transmit <text>            send to the feed (verified humans, once a day)',
         '  open channel               ask to be counted',
@@ -1503,6 +1765,7 @@
           feedKey = null;
           applyState(res.state);
           loadLineup();
+          loadNet();
           leaving.textContent = '  erased. the network counts you as gone.';
           leaving.className = 'w';
         }, function (error) { leaving.textContent = '  ' + error.message; leaving.className = 'r'; });
@@ -1510,6 +1773,24 @@
     } else if (cmd === 'lineup') {
       if (!lineupOn) say('  the lineup is not open on this node yet.');
       else { say('  yesterday\'s answers are standing. call them.'); lineupEl.scrollIntoView({ behavior: reduceMotion ? 'auto' : 'smooth', block: 'start' }); }
+    } else if (cmd === 'nodes' || cmd === 'network') {
+      if (!netOn) say('  the network is not open on this node yet.');
+      else {
+        var roll = say('  listing...');
+        api('/api/nodes').then(function (res) {
+          var lines = ['  ' + plural(res.totals.nodes, 'node', 'nodes') + ' beyond this one. ' + figure(res.totals.machines) + ' machines counted there.'];
+          (res.nodes || []).forEach(function (n) {
+            var name = nodeLabel(n.id) + '  ' + n.host; while (name.length < 34) name += ' ';
+            lines.push('  ' + name + figure(n.machines) + ' machines · kept by ' + pad(n.n));
+          });
+          if (!(res.nodes || []).length) lines.push('  no site has joined yet. node 00 is counting alone.');
+          lines.push('  to make a site a node: open node');
+          roll.textContent = lines.join('\n');
+        }, function (error) { roll.textContent = '  ' + error.message; roll.className = 'r'; });
+      }
+    } else if (cmd === 'open node') {
+      if (!netOn) say('  the network is not open on this node yet.');
+      else { say(me && known ? '  name a site you can edit.' : '  only counted humans open nodes. be counted first.'); netEl.scrollIntoView({ behavior: reduceMotion ? 'auto' : 'smooth', block: 'start' }); }
     } else if (cmd === 'ls') {
       say('  diagnostics.log  humans.txt  robots.txt');
     } else if (cmd === 'cat humans.txt' || cmd === 'humans.txt') {
@@ -1590,11 +1871,11 @@
       me.human.last_tx = res.last_tx;
       save(KEY, me);
       renderMe();
-      if (!was) loadLineup();
+      if (!was) { loadLineup(); loadNet(); }
       // The first pulse of a visit changes the count everyone sees; read it back at once.
       if (!pulsed) { pulsed = true; refresh(); }
     }, function (error) {
-      if (error.code === 'unknown_key') { known = false; renderMe(); loadLineup(); }
+      if (error.code === 'unknown_key') { known = false; renderMe(); loadLineup(); loadNet(); }
     });
   }
 

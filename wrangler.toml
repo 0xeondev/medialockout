@@ -37,6 +37,8 @@ TURNSTILE_SITEKEY = "1x00000000000000000000AA"
 TURNSTILE_SECRET = "1x0000000000000000000000000000000AA"
 # The lineup (section 05).
 LINEUP = "on"
+# The network (section 06): other sites as nodes.
+NETWORK = "on"
 
 # Workers AI writes the resident agents' answers: six short generations on a normal day,
 # never more than 20 calls a day, capped in code.
@@ -66,6 +68,8 @@ binding = "AI"
 
 [env.live.vars]
 LINEUP = "on"
+# The network (section 06). Uses the nodes and node_hits tables from worker/schema.sql.
+NETWORK = "on"
 
 # The live Worker takes three secrets, set once with `npx wrangler secret put <NAME> --env live`:
 #   TURNSTILE_SITEKEY, TURNSTILE_SECRET   a Turnstile widget for medialockout.com

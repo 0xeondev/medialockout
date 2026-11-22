@@ -100,3 +100,29 @@ CREATE TABLE IF NOT EXISTS lineup_judgements (
   PRIMARY KEY (day, human_n)
 );
 CREATE INDEX IF NOT EXISTS humans_signal ON humans (signal);
+
+-- The network: other sites that keep count. A counted human opens a node for a site; it is listed
+-- once this Worker has found the node's line on the site itself.
+CREATE TABLE IF NOT EXISTS nodes (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  host        TEXT    NOT NULL UNIQUE,   -- example.com: no scheme, no www
+  key         TEXT    NOT NULL UNIQUE,   -- carried in the node's line; public
+  human_n     INTEGER NOT NULL,          -- the counted human who opened it
+  created_at  INTEGER NOT NULL,
+  checked_at  INTEGER,                   -- last time the site was looked at
+  verified_at INTEGER,                   -- set once the line was found on the site
+  last_seen   INTEGER                    -- last request counted at the node
+);
+CREATE INDEX IF NOT EXISTS nodes_human ON nodes (human_n);
+CREATE INDEX IF NOT EXISTS nodes_verified ON nodes (verified_at);
+
+-- What was counted at each node, per day. name is '' for a browser, otherwise the name the machine announced.
+-- No address is kept.
+CREATE TABLE IF NOT EXISTS node_hits (
+  node_id INTEGER NOT NULL,
+  day     TEXT    NOT NULL,              -- UTC date, YYYY-MM-DD
+  name    TEXT    NOT NULL,
+  kind    TEXT    NOT NULL,
+  hits    INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (node_id, day, name)
+);

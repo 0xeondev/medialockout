@@ -17,6 +17,9 @@ const REPORTS_TO_HIDE = 3;        // distinct humans whose reports hide a transm
 const REPORTS_PER_DAY = 10;
 const AI_CALLS_PER_DAY = 20;      // hard ceiling on calls to the model per day, whatever the traffic (a normal day uses 6)
 const LINEUP_SIZE = 8;
+const NODES_PER_HUMAN = 3;       // sites one counted human can vouch for
+const NODE_CHECK_GAP = 15000;     // a site is looked at no more often than this
+const NODE_REPEAT_MS = 10000;     // the same client at the same node is counted once in this window
 
 /* ---------- small helpers ---------- */
 
@@ -250,7 +253,7 @@ const PROBES = [
 
 // Paths this node actually has. Anything else is shown without its text, so nobody
 // can write on the feed by requesting a sentence.
-const OWN_PATHS = new Set(['/', '/robots.txt', '/humans.txt', '/privacy', '/protocol.css', '/protocol.js', '/favicon.ico', '/sitemap.xml', '/api/state', '/api/agents']);
+const OWN_PATHS = new Set(['/', '/robots.txt', '/humans.txt', '/privacy', '/protocol.css', '/protocol.js', '/favicon.ico', '/sitemap.xml', '/api/state', '/api/agents', '/api/nodes']);
 
 function probePath(pathname) {
   for (const [pattern, shown] of PROBES) if (pattern.test(pathname)) return shown;
@@ -260,7 +263,7 @@ function probePath(pathname) {
 function classify(request, pathname) {
   const ua = request.headers.get('user-agent') || '';
   const probe = probePath(pathname);
-  const path = OWN_PATHS.has(pathname) || /^\/h\/\d{1,9}$/.test(pathname) ? pathname : probe || '';
+  const path = OWN_PATHS.has(pathname) || /^\/(h|n)\/\d{1,9}$/.test(pathname) ? pathname : probe || '';
   for (const [pattern, name, kind] of KNOWN_AGENTS) if (pattern.test(ua)) return { name, kind, path };
   if (!ua) return { name: 'nameless agent', kind: 'unidentified', path };
   if (/bot|crawl|spider/i.test(ua)) return { name: 'unnamed crawler', kind: 'crawler', path };
@@ -591,6 +594,450 @@ async function apiLineupJudge(env, request) {
   return json({ correct, total: rows.length, reveal: reveal(rows), signal: human.signal + correct });
 }
 
+/* ---------- the network ----------
+   Node 00 is not the only place machines read. Any site can carry one line of markup and become a node:
+   every automated client that fetches that line is counted here by the name it announces, and every
+   browser that runs it is counted as a browser. Only a counted human can open a node, and a node is
+   listed only after this Worker has found the line on the site itself. No address is kept. */
+
+const HOST_SHAPE = /^(?=.{4,100}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}$/;
+const HOST_REFUSED = /(^|\.)(localhost|local|internal|test|example|invalid|onion|lan|home|corp|arpa)$/;
+
+const networkOn = (env) => String(env.NETWORK || '') === 'on';
+const nodeName = (id) => 'node ' + String(id).padStart(2, '0');
+const bare = (host) => String(host || '').toLowerCase().replace(/^www\./, '');
+const esc = (value) => String(value).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const figure = (n) => Number(n || 0).toLocaleString('en-US');
+
+// A site is named by its address alone: no scheme, no path, no www.
+function cleanHost(input, ownHost) {
+  const host = String(input == null ? '' : input)
+    .trim()
+    .toLowerCase()
+    .replace(/^[a-z][a-z0-9+.-]*:\/\//, '')
+    .replace(/[/?#].*$/, '')
+    .replace(/:\d+$/, '')
+    .replace(/^www\./, '')
+    .replace(/\.$/, '');
+  if (!host) return { error: ['empty', 'name the site. example.com'] };
+  if (!HOST_SHAPE.test(host) || HOST_REFUSED.test(host)) return { error: ['bad_host', 'that is not a public site address. example.com'] };
+  if (host === bare(ownHost)) return { error: ['own', 'this is node 00. it is already counting.'] };
+  return { host };
+}
+
+// The line a site carries. The link is the door a crawler follows; the script is what a browser runs.
+const nodeTag = (origin, key) =>
+  '<a href="' + origin + '/d/' + key + '">Lockout node</a><script async src="' + origin + '/n/' + key + '.js"></scr' + 'ipt>';
+
+const nodeMemo = new Map();   // key -> { at, node }
+async function nodeByKey(env, key) {
+  const now = Date.now();
+  const hit = nodeMemo.get(key);
+  if (hit && now - hit.at < 60000) return hit.node;
+  const node = await env.DB.prepare(
+    "SELECT n.id, n.host, n.verified_at, COALESCE((SELECT SUM(hits) FROM node_hits h WHERE h.node_id = n.id AND h.name != ''), 0) AS machines " +
+      'FROM nodes n WHERE n.key = ?'
+  ).bind(key).first();
+  if (nodeMemo.size > 2000) nodeMemo.clear();
+  nodeMemo.set(key, { at: now, node: node || null });
+  return node || null;
+}
+
+let nodesMemo = { at: 0, value: null };
+function forgetNodes(key) {
+  if (key) nodeMemo.delete(key); else nodeMemo.clear();
+  nodesMemo.at = 0;
+  stateMemo.at = 0;
+}
+
+const nodePending = new Map();   // 'id|day|name' -> { id, day, name, kind, hits, at }
+const nodeRecent = new Map();    // 'id|connection|name' -> ms, so one client in a loop is one count
+let nodeFlushAt = 0;
+let nodeFlushScheduled = false;
+
+async function flushNodes(env) {
+  if (!nodePending.size) return;
+  const batch = [...nodePending.values()];
+  nodePending.clear();
+  nodeFlushAt = Date.now();
+  const steps = [];
+  const seen = new Map();
+  for (const h of batch) {
+    steps.push(
+      env.DB.prepare(
+        'INSERT INTO node_hits (node_id, day, name, kind, hits) VALUES (?, ?, ?, ?, ?) ' +
+          'ON CONFLICT(node_id, day, name) DO UPDATE SET hits = hits + excluded.hits'
+      ).bind(h.id, h.day, h.name, h.kind, h.hits)
+    );
+    // A machine seen at a node goes on the record, like one seen here.
+    if (h.name) steps.push(env.DB.prepare('INSERT INTO agent_log (name, kind, path, at) VALUES (?, ?, ?, ?)').bind(h.name, h.kind, 'node:' + h.id, h.at));
+    seen.set(h.id, Math.max(seen.get(h.id) || 0, h.at));
+  }
+  for (const [id, at] of seen) steps.push(env.DB.prepare('UPDATE nodes SET last_seen = ? WHERE id = ?').bind(at, id));
+  await env.DB.batch(steps);
+  nodesMemo.at = 0;
+  stateMemo.at = 0;
+}
+
+// name is '' for a browser. The same client at the same node is counted once every few seconds.
+async function countAtNode(env, ctx, request, node, name, kind) {
+  const now = Date.now();
+  const mark = node.id + '|' + (await ipHash(env, request)) + '|' + name;
+  const last = nodeRecent.get(mark);
+  if (last && now - last < NODE_REPEAT_MS) return;
+  if (nodeRecent.size > 5000) nodeRecent.clear();
+  nodeRecent.set(mark, now);
+  const day = dayOf(now);
+  const slot = node.id + '|' + day + '|' + name;
+  const have = nodePending.get(slot);
+  if (have) {
+    have.hits += 1;
+    have.at = now;
+  } else {
+    nodePending.set(slot, { id: node.id, day, name, kind, hits: 1, at: now });
+  }
+  const report = (error) => console.error('network error:', error);
+  if (now - nodeFlushAt < 8000) {
+    if (!nodeFlushScheduled && ctx && ctx.waitUntil) {
+      nodeFlushScheduled = true;
+      const wait = 8000 - (now - nodeFlushAt);
+      ctx.waitUntil(
+        new Promise((done) => setTimeout(done, wait))
+          .then(() => {
+            nodeFlushScheduled = false;
+            return flushNodes(env);
+          })
+          .catch(report)
+      );
+    }
+    return;
+  }
+  const work = flushNodes(env).catch(report);
+  if (ctx && ctx.waitUntil) ctx.waitUntil(work);
+}
+
+// A browser's report is taken only from the node's own pages.
+function fromNode(request, host) {
+  const referer = request.headers.get('referer');
+  if (referer) {
+    try {
+      return bare(new URL(referer).hostname) === host;
+    } catch {
+      return false;
+    }
+  }
+  return request.headers.get('sec-fetch-site') === 'cross-site';
+}
+
+const crossOrigin = { 'access-control-allow-origin': '*', 'cross-origin-resource-policy': 'cross-origin', 'x-content-type-options': 'nosniff' };
+
+// What a node's line loads. A browser that runs it reports itself once and dresses the link as a badge.
+function nodeScript(origin, key, node) {
+  const label = node.verified_at
+    ? 'Lockout ' + nodeName(node.id) + ' · ' + figure(node.machines) + (Number(node.machines) === 1 ? ' machine counted' : ' machines counted')
+    : 'Lockout node · awaiting its check';
+  return (
+    '/* Media Lockout: this site counts the machines that read it. ' + origin + '/privacy */\n' +
+    '(function(){var o=' + JSON.stringify(origin) + ',k=' + JSON.stringify(key) + ',d=document;' +
+    'try{(new Image()).src=o+"/n/"+k+"/"+(navigator.webdriver?"a":"h")+"?"+Date.now().toString(36)}catch(e){}' +
+    'var a=d.querySelector(\'a[href*="/d/\'+k+\'"]\');if(!a||a.hasAttribute("data-plain"))return;' +
+    'a.textContent="";a.style.cssText="display:inline-flex;align-items:center;gap:8px;padding:7px 10px;border:1px solid #2a2e34;border-radius:4px;' +
+    'background:#0a0b0d;color:#eceef1;font:500 11px/1 ui-monospace,Menlo,Consolas,monospace;letter-spacing:.14em;text-transform:uppercase;text-decoration:none";' +
+    'var m=d.createElement("span");m.style.cssText="flex:none;width:8px;height:8px;background:#d6453d";a.appendChild(m);' +
+    'a.appendChild(d.createTextNode(' + JSON.stringify(label) + '));' +
+    'a.title="This site counts the machines that read it."})();\n'
+  );
+}
+
+// Requests that reach this Worker from a node's pages: the line itself, a browser's report, the door.
+async function nodeTraffic(env, ctx, request, url, path) {
+  const m = path.match(/^\/(n|d)\/([0-9a-f]{16})(\.js|\/[ha])?$/);
+  if (!m || (m[1] === 'd' && m[3]) || (m[1] === 'n' && !m[3])) return null;
+  const node = await nodeByKey(env, m[2]);
+  const agent = classify(request, '');
+
+  if (m[1] === 'd') {
+    if (!node) return notFoundPage();
+    if (agent && node.verified_at) await countAtNode(env, ctx, request, node, agent.name, agent.kind);
+    return new Response(null, { status: 302, headers: { location: url.origin + (node.verified_at ? '/n/' + node.id : '/'), 'cache-control': 'no-store' } });
+  }
+  if (m[3] === '.js') {
+    if (!node) return new Response('/* no such node */\n', { status: 404, headers: { 'content-type': 'text/javascript; charset=utf-8', 'cache-control': 'no-store', ...crossOrigin } });
+    // A machine that fetches the line without running it is counted here, by its own name.
+    if (agent && node.verified_at) await countAtNode(env, ctx, request, node, agent.name, agent.kind);
+    return new Response(nodeScript(url.origin, m[2], node), { headers: { 'content-type': 'text/javascript; charset=utf-8', 'cache-control': 'public, max-age=3600', ...crossOrigin } });
+  }
+  // A browser ran the line: 'h' is a browser, 'a' is one that says it is being driven.
+  if (node && node.verified_at && !agent && fromNode(request, node.host)) {
+    if (m[3] === '/a') await countAtNode(env, ctx, request, node, 'automated browser', 'headless browser');
+    else await countAtNode(env, ctx, request, node, '', 'browser');
+  }
+  return new Response(null, { status: 204, headers: { 'cache-control': 'no-store', ...crossOrigin } });
+}
+
+async function readCapped(response, cap) {
+  if (!response.body || !response.body.getReader) return (await response.text()).slice(0, cap);
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let out = '';
+  while (out.length < cap) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    out += decoder.decode(value, { stream: true });
+  }
+  reader.cancel().catch(() => {});
+  return out;
+}
+
+// Whether a site's own content security policy lets a browser load from this origin. No policy means yes.
+function policyAllows(policy, origin, kinds) {
+  const host = new URL(origin).hostname;
+  // Several policies may apply at once; each one has to allow it.
+  return String(policy || '').split(',').every((one) => {
+    const sets = {};
+    for (const part of one.split(';')) {
+      const words = part.trim().split(/\s+/);
+      if (words[0]) sets[words[0].toLowerCase()] = words.slice(1).map((w) => w.toLowerCase());
+    }
+    const list = kinds.map((kind) => sets[kind]).find(Boolean);
+    if (!list) return true;
+    return list.some((src) => {
+      const name = src.replace(/^https?:\/\//, '').replace(/\/$/, '').replace(/:\d+$/, '');
+      return src === '*' || src === 'https:' || name === host || (name.startsWith('*.') && host.endsWith(name.slice(1)));
+    });
+  });
+}
+
+function policiesOf(response, body) {
+  const found = [response.headers.get('content-security-policy') || ''];
+  const tags = body.match(/<meta[^>]+http-equiv=["']?content-security-policy["']?[^>]*>/gi) || [];
+  for (const tag of tags) {
+    const content = /content=(?:"([^"]*)"|'([^']*)')/i.exec(tag);
+    if (content) found.push(content[1] || content[2] || '');
+  }
+  return found.filter(Boolean).join(',');
+}
+
+// Looks for the node's line on the site itself. This is what makes a listed node real:
+// nobody can list a site they cannot edit.
+async function lineOnSite(env, node, origin) {
+  const get = env.NODE_FETCH || ((target, init) => fetch(target, init));
+  const marks = ['/n/' + node.key + '.js', '/d/' + node.key];
+  let answered = false;
+  for (const target of ['https://' + node.host + '/', 'https://www.' + node.host + '/', 'https://' + node.host + '/lockout.txt']) {
+    try {
+      const response = await get(target, {
+        redirect: 'follow',
+        headers: { 'user-agent': 'MediaLockout-NodeCheck/1.0 (+https://medialockout.com/privacy)', accept: 'text/html,text/plain;q=0.9,*/*;q=0.5' },
+        signal: AbortSignal.timeout(8000),
+      });
+      // A site that hands the request to another address has not answered for itself.
+      if (bare(new URL(response.url || target).hostname) !== node.host || !response.ok) continue;
+      answered = true;
+      const body = await readCapped(response, 800000);
+      if (target.endsWith('/lockout.txt')) {
+        if (body.includes(node.key)) return { found: true };
+        continue;
+      }
+      if (marks.some((mark) => body.includes(mark))) {
+        // The line is there. A strict policy on the site can still stop browsers from loading it.
+        const policy = policiesOf(response, body);
+        const allowed = policyAllows(policy, origin, ['script-src-elem', 'script-src', 'default-src']) && policyAllows(policy, origin, ['img-src', 'default-src']);
+        return { found: true, blocked: !allowed };
+      }
+    } catch {}
+  }
+  return { found: false, reason: answered ? 'the site answered, but the line is not on its front page yet.' : 'the site did not answer over https.' };
+}
+
+async function nodesList(env) {
+  const now = Date.now();
+  if (nodesMemo.value && now - nodesMemo.at < 10000) return nodesMemo.value;
+  const [rows, sums] = await env.DB.batch([
+    env.DB.prepare(
+      'SELECT n.id, n.host, n.human_n AS n, n.verified_at AS since, n.last_seen, ' +
+        "COALESCE((SELECT SUM(hits) FROM node_hits h WHERE h.node_id = n.id AND h.name != ''), 0) AS machines, " +
+        "COALESCE((SELECT SUM(hits) FROM node_hits h WHERE h.node_id = n.id AND h.name = ''), 0) AS browsers " +
+        'FROM nodes n WHERE n.verified_at IS NOT NULL ORDER BY machines DESC, n.id ASC LIMIT 50'
+    ),
+    env.DB.prepare(
+      'SELECT (SELECT COUNT(*) FROM nodes WHERE verified_at IS NOT NULL) AS nodes, ' +
+        "COALESCE(SUM(CASE WHEN name != '' THEN hits ELSE 0 END), 0) AS machines, " +
+        "COALESCE(SUM(CASE WHEN name = '' THEN hits ELSE 0 END), 0) AS browsers FROM node_hits"
+    ),
+  ]);
+  const totals = sums.results[0] || { nodes: 0, machines: 0, browsers: 0 };
+  const value = { nodes: rows.results || [], totals: { nodes: totals.nodes || 0, machines: totals.machines || 0, browsers: totals.browsers || 0 } };
+  nodesMemo = { at: now, value };
+  return value;
+}
+
+const mineOf = async (env, url, human) =>
+  ((await env.DB.prepare('SELECT id, host, key, created_at, verified_at, last_seen FROM nodes WHERE human_n = ? ORDER BY id').bind(human.n).all()).results || []).map(
+    (node) => ({ id: node.id, host: node.host, created_at: node.created_at, verified_at: node.verified_at, last_seen: node.last_seen, key: node.key, tag: nodeTag(url.origin, node.key) })
+  );
+
+async function apiNodes(env, request, url) {
+  const list = await nodesList(env);
+  const out = { ...list, limit: NODES_PER_HUMAN, now: Date.now() };
+  if (request.method === 'POST') {
+    const body = await readJson(request);
+    const human = body && (await humanByToken(env, body.token));
+    out.counted = !!human;
+    if (human) out.mine = await mineOf(env, url, human);
+  }
+  return json(out);
+}
+
+async function apiNodeOpen(env, request, url) {
+  const body = await readJson(request);
+  const human = body && (await humanByToken(env, body.token));
+  if (!human) return fail(401, 'unknown_key', 'only counted humans can open a node.');
+  const cleaned = cleanHost(body.host, url.hostname);
+  if (cleaned.error) return fail(400, cleaned.error[0], cleaned.error[1]);
+  if (blocked(env, cleaned.host)) return fail(400, 'filtered', 'that site was refused.');
+  const now = Date.now();
+
+  const taken = await env.DB.prepare('SELECT id, human_n, verified_at, created_at FROM nodes WHERE host = ?').bind(cleaned.host).first();
+  if (taken && taken.human_n !== human.n) {
+    if (taken.verified_at) return fail(409, 'taken', 'that site is already a node.');
+    // A claim nobody completed lapses after a day.
+    if (now - taken.created_at < DAY) return fail(409, 'claimed', 'another human is setting that site up. try again tomorrow.');
+    await env.DB.prepare('DELETE FROM nodes WHERE id = ? AND verified_at IS NULL').bind(taken.id).run();
+  }
+  if (!taken || taken.human_n !== human.n) {
+    const held = await env.DB.prepare('SELECT COUNT(*) AS v FROM nodes WHERE human_n = ?').bind(human.n).first('v');
+    if (held >= NODES_PER_HUMAN) return fail(429, 'limit', NODES_PER_HUMAN + ' nodes to a human. close one first.');
+    try {
+      await env.DB.prepare('INSERT INTO nodes (host, key, human_n, created_at) VALUES (?, ?, ?, ?)').bind(cleaned.host, randHex(8), human.n, now).run();
+    } catch {
+      return fail(409, 'taken', 'that site is already a node.');
+    }
+  }
+  return json({ opened: true, host: cleaned.host, mine: await mineOf(env, url, human) });
+}
+
+async function apiNodeCheck(env, request, url) {
+  const body = await readJson(request);
+  const human = body && (await humanByToken(env, body.token));
+  if (!human) return fail(401, 'unknown_key', 'only counted humans can open a node.');
+  const id = Number(body.id);
+  const node = Number.isInteger(id) ? await env.DB.prepare('SELECT id, host, key, verified_at, checked_at FROM nodes WHERE id = ? AND human_n = ?').bind(id, human.n).first() : null;
+  if (!node) return fail(404, 'not_found', 'no such node.');
+  const now = Date.now();
+  if (node.checked_at && now - node.checked_at < NODE_CHECK_GAP) return fail(429, 'rate', 'the site was just looked at. wait a few seconds.');
+  await env.DB.prepare('UPDATE nodes SET checked_at = ? WHERE id = ?').bind(now, node.id).run();
+  const look = await lineOnSite(env, node, url.origin);
+  // A listed node stays listed: the site was proven once. The look only reports what it sees now.
+  if (!look.found && !node.verified_at) return fail(400, 'no_line', look.reason);
+  if (!node.verified_at) {
+    await env.DB.prepare('UPDATE nodes SET verified_at = ? WHERE id = ? AND verified_at IS NULL').bind(now, node.id).run();
+    forgetNodes(node.key);
+  }
+  const warn = !look.found
+    ? look.reason
+    : look.blocked
+      ? "the site's content security policy stops browsers from loading the line. allow " + url.origin + ' under script-src and img-src.'
+      : null;
+  return json({ verified: true, id: node.id, warn, mine: await mineOf(env, url, human), ...(await nodesList(env)) });
+}
+
+async function removeNode(env, id) {
+  const node = await env.DB.prepare('SELECT key FROM nodes WHERE id = ?').bind(id).first();
+  await env.DB.batch([
+    env.DB.prepare('DELETE FROM node_hits WHERE node_id = ?').bind(id),
+    env.DB.prepare("DELETE FROM agent_log WHERE path = ?").bind('node:' + id),
+    env.DB.prepare('DELETE FROM nodes WHERE id = ?').bind(id),
+  ]);
+  forgetNodes(node && node.key);
+}
+
+// A node stands on a human's word. When the human goes, so do their nodes.
+async function closeNodesOf(env, humanN) {
+  const held = await env.DB.prepare('SELECT id FROM nodes WHERE human_n = ?').bind(humanN).all();
+  for (const node of held.results || []) await removeNode(env, node.id);
+}
+
+async function apiNodeClose(env, request, url) {
+  const body = await readJson(request);
+  const human = body && (await humanByToken(env, body.token));
+  if (!human) return fail(401, 'unknown_key', 'only counted humans can open a node.');
+  const id = Number(body.id);
+  const node = Number.isInteger(id) ? await env.DB.prepare('SELECT id FROM nodes WHERE id = ? AND human_n = ?').bind(id, human.n).first() : null;
+  if (!node) return fail(404, 'not_found', 'no such node.');
+  await removeNode(env, node.id);
+  return json({ closed: true, mine: await mineOf(env, url, human), ...(await nodesList(env)) });
+}
+
+async function adminNodes(env) {
+  const rows = await env.DB.prepare(
+    'SELECT n.id, n.host, n.human_n AS n, n.created_at, n.verified_at, n.last_seen, ' +
+      'COALESCE((SELECT SUM(hits) FROM node_hits h WHERE h.node_id = n.id), 0) AS hits FROM nodes n ORDER BY n.id DESC LIMIT 200'
+  ).all();
+  return json({ nodes: rows.results || [], now: Date.now() });
+}
+
+async function adminNode(env, request) {
+  const body = await readJson(request);
+  const id = body && Number(body.id);
+  if (!Number.isInteger(id) || id < 1) return fail(400, 'bad_request', 'no such node.');
+  await removeNode(env, id);
+  return json({ ok: true });
+}
+
+// A node's own page: what was counted there, and nothing that was not.
+async function nodePage(env, id) {
+  const node = await env.DB.prepare('SELECT id, host, human_n, verified_at, last_seen FROM nodes WHERE id = ? AND verified_at IS NOT NULL').bind(id).first();
+  if (!node) return notFoundPage();
+  const [names, days] = await env.DB.batch([
+    env.DB.prepare('SELECT name, kind, SUM(hits) AS hits FROM node_hits WHERE node_id = ? GROUP BY name, kind ORDER BY hits DESC LIMIT 40').bind(id),
+    env.DB.prepare(
+      "SELECT day, SUM(CASE WHEN name != '' THEN hits ELSE 0 END) AS machines, SUM(CASE WHEN name = '' THEN hits ELSE 0 END) AS browsers " +
+        'FROM node_hits WHERE node_id = ? GROUP BY day ORDER BY day DESC LIMIT 7'
+    ).bind(id),
+  ]);
+  const rows = names.results || [];
+  const machines = rows.filter((r) => r.name).reduce((sum, r) => sum + r.hits, 0);
+  const browsers = rows.filter((r) => !r.name).reduce((sum, r) => sum + r.hits, 0);
+  const all = machines + browsers;
+  const iso = (ms) => new Date(ms).toISOString().slice(0, 16).replace('T', ' ') + ' UTC';
+  const title = nodeName(node.id).replace('n', 'N') + ' · ' + node.host;
+  const about = 'Machines counted at ' + node.host + ', a node of Media Lockout: ' + figure(machines) + ' so far.';
+  const table = (head, lines) =>
+    '<table><thead><tr>' + head.map((h, i) => '<th' + (i ? ' class="n"' : '') + '>' + h + '</th>').join('') + '</tr></thead><tbody>' + lines.join('') + '</tbody></table>';
+  const body =
+    '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">' +
+    '<title>' + esc(title) + ' — Media Lockout</title><meta name="description" content="' + esc(about) + '">' +
+    '<meta property="og:title" content="' + esc(title) + '"><meta property="og:description" content="' + esc(about) + '">' +
+    '<style>body{margin:0;padding:56px 24px 80px;background:#0a0b0d;color:#a6abb3;font:15px/1.7 ui-monospace,Menlo,Consolas,monospace}' +
+    'main{max-width:720px;margin:0 auto}small{display:block;font-size:12px;letter-spacing:.24em;text-transform:uppercase;color:#d6453d}' +
+    'h1{margin:14px 0 6px;font:400 clamp(34px,7vw,64px)/1.02 "Arial Black",Arial,sans-serif;color:#eceef1}' +
+    '.host{margin:0 0 36px;font-size:18px;overflow-wrap:anywhere}a{color:#c9ccd1}' +
+    'dl{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:1px;margin:0 0 36px;background:#1c1f24;border:1px solid #1c1f24;border-radius:4px;overflow:hidden}' +
+    'dl div{padding:18px;background:#0e1013}dt{font-size:11px;letter-spacing:.2em;text-transform:uppercase;color:#8a9099}' +
+    'dd{margin:8px 0 0;font:400 30px/1 "Arial Black",Arial,sans-serif;color:#eceef1;font-variant-numeric:tabular-nums}' +
+    'h2{margin:36px 0 10px;font-size:12px;font-weight:500;letter-spacing:.2em;text-transform:uppercase;color:#eceef1}p{margin:0 0 10px}' +
+    'table{width:100%;border-collapse:collapse;font-size:14px;font-variant-numeric:tabular-nums}th{padding:8px 0;font-weight:500;font-size:11px;letter-spacing:.18em;text-transform:uppercase;color:#8a9099;text-align:left;border-bottom:1px solid #2a2e34}' +
+    'td{padding:8px 0;border-bottom:1px solid #1c1f24;color:#c9ccd1}td.k{color:#8a9099}.n{text-align:right}' +
+    'footer{margin-top:56px;padding-top:24px;border-top:1px solid #1c1f24;font-size:13px;color:#8a9099}</style></head><body><main>' +
+    '<small>Media Lockout // the network</small><h1>' + esc(nodeName(node.id).replace('n', 'N')) + '</h1>' +
+    '<p class="host"><a href="https://' + esc(node.host) + '/" rel="nofollow noopener">' + esc(node.host) + '</a></p>' +
+    '<dl><div><dt>Machines counted</dt><dd>' + figure(machines) + '</dd></div><div><dt>Browsers seen</dt><dd>' + figure(browsers) + '</dd></div>' +
+    '<div><dt>Share that was machines</dt><dd>' + (all ? Math.round((machines / all) * 100) + '%' : '—') + '</dd></div></dl>' +
+    '<p>Kept by <a href="/h/' + node.human_n + '">human ' + pad(node.human_n) + '</a>. Counting since ' + iso(node.verified_at) + '. ' +
+    (node.last_seen ? 'Last request counted ' + iso(node.last_seen) + '.' : 'Nothing has been counted here yet.') + '</p>' +
+    '<h2>Who read it</h2>' +
+    (rows.length
+      ? table(['Name', 'Kind', 'Requests'], rows.map((r) => '<tr><td>' + esc(r.name || 'browser') + '</td><td class="k">' + esc(r.kind) + '</td><td class="n">' + figure(r.hits) + '</td></tr>'))
+      : '<p>No request has been counted at this node yet.</p>') +
+    (days.results && days.results.length
+      ? '<h2>Last days on record</h2>' + table(['Day (UTC)', 'Machines', 'Browsers'], days.results.map((d) => '<tr><td>' + esc(d.day) + '</td><td class="n">' + figure(d.machines) + '</td><td class="n">' + figure(d.browsers) + '</td></tr>'))
+      : '') +
+    '<h2>What is counted</h2><p>Every client that loads this node\'s line. A machine is counted by the name it announces. One that passes for a browser without running the page is not counted, so the machine figure is a floor. The same client is counted at most once every few seconds. No address is kept.</p>' +
+    '<footer><p><a href="/">return to node 00</a> · <a href="/privacy">what is kept</a></p></footer></main></body></html>';
+  return new Response(body, { headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'public, max-age=60', 'x-content-type-options': 'nosniff' } });
+}
+
 /* ---------- shared state ---------- */
 
 let stateMemo = { at: 0, value: null };
@@ -598,7 +1045,8 @@ let stateMemo = { at: 0, value: null };
 async function getState(env, fresh) {
   const now = Date.now();
   if (!fresh && stateMemo.value && now - stateMemo.at < 4000) return { ...stateMemo.value, now };
-  const [total, online, feed, hits, active, visits] = await env.DB.batch([
+  const network = networkOn(env);
+  const [total, online, feed, hits, active, visits, joined] = await env.DB.batch([
     env.DB.prepare('SELECT MAX(n) AS v FROM humans'),
     env.DB.prepare('SELECT COUNT(*) AS v FROM humans WHERE last_seen > ?').bind(now - ONLINE_WINDOW),
     env.DB.prepare(
@@ -608,12 +1056,23 @@ async function getState(env, fresh) {
     env.DB.prepare("SELECT v FROM meta WHERE k = 'agent_hits'"),
     env.DB.prepare('SELECT COUNT(*) AS v FROM agents WHERE last_seen > ?').bind(now - AGENT_WINDOW),
     env.DB.prepare('SELECT name, kind, path, at FROM agent_log ORDER BY id DESC LIMIT 20'),
-  ]);
+  ].concat(network ? [env.DB.prepare('SELECT id, host, human_n AS n, verified_at AS at FROM nodes WHERE verified_at IS NOT NULL ORDER BY verified_at DESC LIMIT 200')] : []));
+  const sites = new Map(((joined && joined.results) || []).map((node) => [node.id, node]));
   const said = (feed.results || []).map((t) => ({ id: t.id, n: t.n, text: t.text, at: t.at, first: !!t.first, reignited: !!t.reignited }));
   // The feed is the record itself: what humans said and what agents asked for, newest first. Nothing else.
   const events = said
     .map((t) => ({ t: 'human', ...t }))
-    .concat((visits.results || []).map((v) => ({ t: 'agent', name: v.name, kind: v.kind, path: v.path, at: v.at })))
+    .concat(
+      (visits.results || []).map((v) => {
+        const at = /^node:(\d+)$/.exec(v.path);
+        if (!at) return { t: 'agent', name: v.name, kind: v.kind, path: v.path, at: v.at };
+        // Seen at another node: shown with that node's name, or not at all if the node is gone.
+        const site = sites.get(Number(at[1]));
+        return site ? { t: 'agent', name: v.name, kind: v.kind, path: '', node: { id: site.id, host: site.host }, at: v.at } : null;
+      })
+    )
+    .concat([...sites.values()].slice(0, 5).map((node) => ({ t: 'node', id: node.id, host: node.host, n: node.n, at: node.at })))
+    .filter(Boolean)
     .sort((a, b) => b.at - a.at)
     .slice(0, 20);
   const value = {
@@ -627,6 +1086,7 @@ async function getState(env, fresh) {
     },
     lineup: String(env.LINEUP || '') === 'on',
   };
+  if (network) value.net = (await nodesList(env)).totals;
   value.last = value.feed.length ? { n: value.feed[0].n, at: value.feed[0].at } : null;
   stateMemo = { at: now, value };
   return { ...value, now };
@@ -826,6 +1286,7 @@ async function apiForget(env, request) {
     env.DB.prepare('DELETE FROM lineup_judgements WHERE human_n = ?').bind(human.n),
     env.DB.prepare('DELETE FROM humans WHERE n = ?').bind(human.n),
   ]);
+  if (networkOn(env)) await closeNodesOf(env, human.n);
   stateMemo.at = 0;
   return json({ forgotten: true, state: await getState(env, true) });
 }
@@ -868,6 +1329,7 @@ async function adminHuman(env, request) {
     env.DB.prepare('UPDATE transmissions SET hidden = 1 WHERE human_n = ?').bind(n),
     env.DB.prepare('DELETE FROM humans WHERE n = ?').bind(n),
   ]);
+  if (networkOn(env)) await closeNodesOf(env, n);
   stateMemo.at = 0;
   return json({ ok: true });
 }
@@ -877,7 +1339,7 @@ function controlPage() {
     '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">' +
     '<title>Node 00 — control</title><meta name="robots" content="noindex,nofollow">' +
     '<style>body{margin:0;padding:32px 24px;background:#0a0b0d;color:#c9ccd1;font:14px/1.6 ui-monospace,Menlo,Consolas,monospace}' +
-    'main{max-width:920px;margin:0 auto}h1{margin:0 0 20px;font-size:13px;font-weight:500;letter-spacing:.18em;text-transform:uppercase;color:#8a9099}' +
+    'main{max-width:920px;margin:0 auto}#nl h1{margin-top:48px}h1{margin:0 0 20px;font-size:13px;font-weight:500;letter-spacing:.18em;text-transform:uppercase;color:#8a9099}' +
     'input,button{font:inherit;color:#eceef1;background:#0e1013;border:1px solid #2a2e34;border-radius:4px;padding:8px 12px}' +
     'input{width:min(100%,360px);box-sizing:border-box}button{cursor:pointer}button:hover{border-color:#8a9099}' +
     'form{display:flex;flex-wrap:wrap;gap:8px}#s{min-height:22px;color:#8a9099}' +
@@ -886,8 +1348,8 @@ function controlPage() {
     '.acts{display:flex;gap:8px;align-items:flex-start}.red{color:#d6453d}</style></head><body><main>' +
     '<h1>Media Lockout // node 00 // control</h1>' +
     '<form id="f"><input id="k" type="password" autocomplete="off" placeholder="admin key" aria-label="Admin key"><button>Open</button></form>' +
-    '<p id="s" role="status"></p><div id="l"></div></main><script>' +
-    '(function(){var key="",s=document.getElementById("s"),l=document.getElementById("l");' +
+    '<p id="s" role="status"></p><div id="l"></div><div id="nl"></div></main><script>' +
+    '(function(){var key="",s=document.getElementById("s"),l=document.getElementById("l"),nl=document.getElementById("nl");' +
     'function call(path,body){return fetch(path,{method:body?"POST":"GET",headers:{"x-admin-key":key,"content-type":"application/json"},body:body?JSON.stringify(body):undefined}).then(function(r){if(!r.ok)throw new Error(r.status===404?"refused. wrong key, or no ADMIN_KEY is set on this Worker.":"error "+r.status);return r.json()})}' +
     'function el(t,c,x){var e=document.createElement(t);if(c)e.className=c;if(x!=null)e.textContent=x;return e}' +
     'function pad(n){n=String(n);while(n.length<5)n="0"+n;return"#"+n}' +
@@ -897,7 +1359,12 @@ function controlPage() {
     'if(t.reports){a.appendChild(document.createTextNode(" "));a.appendChild(el("small","red",t.reports+(t.reports===1?" report":" reports")))}a.appendChild(el("p",null,t.text));' +
     'var h=el("button",null,t.hidden?"Show":"Hide");h.type="button";h.onclick=function(){call("/api/admin/transmission",{id:t.id,hidden:t.hidden?0:1}).then(load,fail)};' +
     'var r=el("button","red","Remove human");r.type="button";r.onclick=function(){if(r.textContent!=="Sure?"){r.textContent="Sure?";return}call("/api/admin/human",{n:t.n}).then(load,fail)};' +
-    'b.appendChild(h);b.appendChild(r);row.appendChild(a);row.appendChild(b);l.appendChild(row)})},fail)}' +
+    'b.appendChild(h);b.appendChild(r);row.appendChild(a);row.appendChild(b);l.appendChild(row)});nodes()},fail)}' +
+    'function nodes(){call("/api/admin/nodes").then(function(d){nl.textContent="";if(!d.nodes.length)return;nl.appendChild(el("h1",null,"Nodes"));' +
+    'd.nodes.forEach(function(n){var row=el("div","row"),a=el("div"),b=el("div","acts");' +
+    'a.appendChild(el("small",null,"node "+n.id+" · opened by "+pad(n.n)+" · "+(n.verified_at?"listed":"waiting for its line")+" · "+n.hits+" counted"));a.appendChild(el("p",null,n.host));' +
+    'var r=el("button","red","Remove node");r.type="button";r.onclick=function(){if(r.textContent!=="Sure?"){r.textContent="Sure?";return}call("/api/admin/node",{id:n.id}).then(nodes,fail)};' +
+    'b.appendChild(r);row.appendChild(a);row.appendChild(b);nl.appendChild(row)})},function(){})}' +
     'function fail(e){s.textContent=e.message}' +
     'document.getElementById("f").addEventListener("submit",function(e){e.preventDefault();key=document.getElementById("k").value;document.getElementById("k").value="";load()})})();' +
     '</script></body></html>';
@@ -914,6 +1381,7 @@ function privacyPage() {
     ['Others involved', 'Cloudflare hosts this node and, on the last step of verification, may run its Turnstile check against automated traffic. The typefaces are loaded from Google Fonts by your browser.'],
     ['Reports', 'A counted human can report a transmission. Enough reports hide it until it is reviewed.'],
     ['The lineup', 'Where the lineup is open, a counted human may answer the day\'s question. The answer is stored with their number, shown the next day without it, and labelled once a human has called it. The resident agents\' answers are written by a model run on Cloudflare Workers AI; nothing a human wrote is sent to it.'],
+    ['Nodes', 'A counted human can make another site a node by placing one line on it. From a visitor of that site this node receives one request per page. It is counted as a machine, by the name it announces, or as a browser, and only the daily totals are kept: no address, no page, no cookie. The site\'s address and the number of the human who opened it are public. Erasing a human closes their nodes.'],
     ['To be forgotten', 'Type "forget me" in the diagnostics terminal. Your number, measurements and transmissions are deleted. The number is not issued again.'],
   ];
   const body =
@@ -981,6 +1449,7 @@ async function humansTxt(env) {
     'counted: ' + state.total,
     'online: ' + state.online,
     'agents counted: ' + state.agents.seen,
+    ...(state.net ? ['nodes: ' + state.net.nodes, 'machines counted at the nodes: ' + state.net.machines] : []),
     'signal: ' + signalOf(state).replace('-', ' '),
     'last transmission: ' + (state.last ? iso(state.last.at) + ' by ' + pad(state.last.n) : 'none on record'),
     '',
@@ -1058,6 +1527,12 @@ async function route(request, env, ctx) {
   const path = url.pathname.replace(/\/+$/, '') || '/';
   const method = request.method;
 
+  // Requests from the pages of other nodes are counted against those nodes, not against this one.
+  if (networkOn(env) && (method === 'GET' || method === 'HEAD')) {
+    const served = await nodeTraffic(env, ctx, request, url, path);
+    if (served) return served;
+  }
+
   try {
     const agent = classify(request, path);
     if (agent) {
@@ -1088,6 +1563,7 @@ async function route(request, env, ctx) {
         if (!isOwner(env, request)) return fail(404, 'not_found', 'no such endpoint.');
         if (path === '/api/admin/transmission') return adminTransmission(env, request);
         if (path === '/api/admin/human') return adminHuman(env, request);
+        if (path === '/api/admin/node') return adminNode(env, request);
         return fail(404, 'not_found', 'no such endpoint.');
       }
       if (path === '/api/challenge') return apiChallenge(env, request);
@@ -1100,12 +1576,20 @@ async function route(request, env, ctx) {
         if (path === '/api/lineup/answer') return apiLineupAnswer(env, request);
         if (path === '/api/lineup/judge') return apiLineupJudge(env, request);
       }
+      if (networkOn(env)) {
+        if (path === '/api/nodes') return apiNodes(env, request, url);
+        if (path === '/api/node/open') return apiNodeOpen(env, request, url);
+        if (path === '/api/node/check') return apiNodeCheck(env, request, url);
+        if (path === '/api/node/close') return apiNodeClose(env, request, url);
+      }
       if (path === '/api/forget') return apiForget(env, request);
     }
     if (method === 'GET') {
       if (path === '/api/admin/transmissions') return isOwner(env, request) ? adminList(env) : fail(404, 'not_found', 'no such endpoint.');
       if (path === '/api/state') return json(await getState(env));
       if (path === '/api/agents') return apiAgents(env);
+      if (path === '/api/admin/nodes') return !isOwner(env, request) ? fail(404, 'not_found', 'no such endpoint.') : networkOn(env) ? adminNodes(env) : json({ nodes: [], now: Date.now() });
+      if (path === '/api/nodes' && networkOn(env)) return apiNodes(env, request, url);
       const m = path.match(/^\/api\/human\/(\d{1,9})$/);
       if (m) return apiHuman(env, Number(m[1]));
     }
@@ -1122,6 +1606,8 @@ async function route(request, env, ctx) {
   if (path === '/control') return controlPage();
   const h = path.match(/^\/h\/(\d{1,9})$/);
   if (h && Number(h[1]) > 0) return page(env, Number(h[1]));
+  const n = path.match(/^\/n\/(\d{1,9})$/);
+  if (n && networkOn(env)) return nodePage(env, Number(n[1]));
   return notFoundPage();
 }
 

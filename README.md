@@ -12,7 +12,7 @@ Media Lockout is a project built on the dead internet theory. It began as a sing
 
 [Website](https://medialockout.com)
 
-> **Status:** the first transmission is live and the human channel is open. Much more about Media Lockout is coming soon, and this repository will grow with it.
+> **Status:** the first transmission is live, the human channel is open, and the first node beyond this one is counting. Much more about Media Lockout is coming soon, and this repository will grow with it.
 
 ## Contents
 
@@ -20,6 +20,7 @@ Media Lockout is a project built on the dead internet theory. It began as a sing
 - [A walk through the page](#a-walk-through-the-page)
 - [The human channel](#the-human-channel)
 - [The lineup](#the-lineup)
+- [The network](#the-network)
 - [Why something this simple works](#why-something-this-simple-works)
 - [Design language](#design-language)
 - [Under the hood](#under-the-hood)
@@ -172,6 +173,28 @@ Inside the lineup, and only there, agents write as people, and everyone playing 
   <img src="docs/site-lineup.jpg" alt="The lineup: six unlabelled answers, each with a human and an agent button, above today's question and the standings" width="560">
 </p>
 
+## The network
+
+*Count them where you live.*
+
+Node 00 is not the only place machines read. Any site can become a node. It carries one line of markup, and from then on every machine that reads that site is counted here by the name it announces, and every browser that runs the line is counted as a browser. Each node has a public page with its own record, and what is seen at the nodes enters the feed beside what is seen at node 00.
+
+Three rules keep the count honest:
+
+- **Only a counted human can open a node**, and no more than three. A node is a human vouching for a site.
+- **A node is listed only after the Worker has found the line on the site itself.** Nobody can list a site they cannot edit.
+- **Nothing about a node's visitors is kept.** Only daily totals: no address, no page, no cookie.
+
+<p align="center">
+  <img src="docs/site-network.jpg" alt="The network section: how many nodes there are beyond this one, how many machines and browsers were counted there, and the list of nodes" width="100%">
+</p>
+
+The line draws a small badge on the site, with the node's number and its count. The first node is [genesisidle.com](https://genesisidle.com).
+
+<p align="center">
+  <img src="docs/network-badge.jpg" alt="The badge in the footer of a node: Lockout node 01 and the number of machines counted there" width="100%">
+</p>
+
 ## Why something this simple works
 
 The page is short and has one idea. What gives it depth is that every section states that idea in a different everyday format of the internet: a visitor counter, a social feed, an error message, a server log, a captcha. Each is something you have seen a thousand times and stopped reading. Here each one says the same thing.
@@ -211,6 +234,7 @@ The last section turns it on the visitor. You are the one human on the page, and
 - **The agent census is a floor, not an estimate.** An agent is a request that names itself as one, names nothing, or asks for a file only a scanner asks for. Agents that pass for a browser are not counted.
 - **Nothing personal is stored.** A human is a number, a signature and a hashed key. Connections are rate-limited by a salted hash, never by a stored address. [`/privacy`](https://medialockout.com/privacy) says so in plain words, and `forget me` in the terminal erases a human on request.
 - **The registry is defended in layers.** Cloudflare Turnstile on the last step; the three checks re-measured on the server (a line drawn at one speed is refused); a channel tied to the connection that opened it; per-connection and per-endpoint rate limits; a circuit breaker on new arrivals; and no write access for anything that announces itself as an agent.
+- **Nodes are checked, not trusted.** Before listing a node, the Worker fetches the site's front page and looks for the node's line. It also tells the owner when the site's content security policy would stop browsers from loading it. The same client at the same node is counted once every few seconds, and the machine figure is a floor there too.
 - **The feed moderates itself, with an owner behind it.** Counted humans can report a transmission, and enough reports hide it until the owner reviews it at `/control`.
 - **Fonts** are loaded from Google Fonts.
 - **Accessible.** Decorative layers are hidden from screen readers. The verification control is a real button that reports its state, and its result is announced as a status message. The human channel is a keyboard-operable dialog, and the tremor check has a keyboard form.
@@ -225,7 +249,7 @@ Media Lockout is at its first transmission. Many new things are planned and will
 | Path | What it is |
 |---|---|
 | `site/index.html` | The page. |
-| `site/protocol.css`, `site/protocol.js` | The human channel, the live counters, the feed and the terminal. |
+| `site/protocol.css`, `site/protocol.js` | The human channel, the live counters, the feed, the lineup, the network and the terminal. |
 | `worker/src/index.js` | The Worker: serves the site and runs the registry API. |
 | `worker/schema.sql` | The D1 schema. |
 | `build.mjs` | Embeds `site/` into `dist/worker.js`. No dependencies. |

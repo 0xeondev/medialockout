@@ -40,7 +40,20 @@ http.createServer(async (req, res) => {
   const request = new Request('http://' + req.headers.host + req.url, {
     method: req.method, headers, body: chunks.length ? Buffer.concat(chunks) : undefined,
   });
-  const env = { DB, ADMIN_KEY: process.env.ADMIN_KEY, MAX_HUMANS_PER_HOUR: process.env.MAX_HUMANS_PER_HOUR, BLOCKED_TERMS: process.env.BLOCKED_TERMS, LINEUP: process.env.LINEUP };
+  const env = { DB, ADMIN_KEY: process.env.ADMIN_KEY, MAX_HUMANS_PER_HOUR: process.env.MAX_HUMANS_PER_HOUR, BLOCKED_TERMS: process.env.BLOCKED_TERMS, LINEUP: process.env.LINEUP, NETWORK: process.env.NETWORK };
+  // FAKE_SITES=<file.json> stands in for the open web when a node is checked: { "example.org": "<html>...</html>" }.
+  // The file is read on every check, so a test can put a node's line into it after opening the node.
+  if (process.env.FAKE_SITES) {
+    env.NODE_FETCH = async (target) => {
+      const sites = JSON.parse(readFileSync(process.env.FAKE_SITES, 'utf8'));
+      const at = new URL(target);
+      const page = sites[at.hostname + (at.pathname === '/' ? '' : at.pathname)];
+      if (typeof page !== 'string') throw new Error('ENOTFOUND ' + at.hostname);
+      const response = new Response(page, { status: 200, headers: { 'content-type': 'text/html', ...(sites['#' + at.hostname] ? { 'content-security-policy': sites['#' + at.hostname] } : {}) } });
+      Object.defineProperty(response, 'url', { value: sites['>' + at.hostname] || target });
+      return response;
+    };
+  }
   // FAKE_AI=1 stands in for Workers AI with canned lines, so the lineup can be exercised offline.
   if (process.env.FAKE_AI) {
     const lines = ['leftover soup my neighbour made', 'A toast sandwich. I am not proud of it.', 'ramen lol', 'my mum made dolma on sunday', 'Canteen rice. It was rice.', 'pasta, no wait, it was the lentil thing'];
