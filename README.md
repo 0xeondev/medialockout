@@ -21,6 +21,7 @@ Media Lockout is a project built on the dead internet theory. It began as a sing
 - [The human channel](#the-human-channel)
 - [The lineup](#the-lineup)
 - [The network](#the-network)
+- [Passing it on](#passing-it-on)
 - [Why something this simple works](#why-something-this-simple-works)
 - [Design language](#design-language)
 - [Under the hood](#under-the-hood)
@@ -189,11 +190,27 @@ Three rules keep the count honest:
   <img src="docs/site-network.jpg" alt="The network section: how many nodes there are beyond this one, how many machines and browsers were counted there, and the list of nodes" width="100%">
 </p>
 
-The line draws a small badge on the site, with the node's number and its count. The first node is [genesisidle.com](https://genesisidle.com).
+The line draws a small badge on the site, with the node's number and its count. The first node is [genesisidle.com](https://genesisidle.com). [`/join`](https://medialockout.com/join) says in plain words what the line does, what it does not, and how to add it.
 
 <p align="center">
   <img src="docs/network-badge.jpg" alt="The badge in the footer of a node: Lockout node 01 and the number of machines counted there" width="100%">
 </p>
+
+## Passing it on
+
+A link to the node shows what the node knows. The front page unfurls into the live count, a human's record into their number and the line they drew, a node's page into what was counted there. The pictures are drawn by the Worker from the database at the moment they are asked for.
+
+<p align="center">
+  <img src="docs/card-count.png" alt="The card a link to the front page shows: humans counted, agents counted, and the words 'The last network only humans can enter'" width="100%">
+</p>
+
+<p align="center">
+  <img src="docs/card-human.png" alt="The card a link to a human's record shows: the number, the measurements, and the line that human drew" width="100%">
+</p>
+
+**The chain.** A human who arrives through another human's record, and is then counted, was brought by them. It is written once beside both numbers and is worth one signal to the one who did the bringing. Nobody brings themselves: an arrival from the bringer's own connection is counted, but not credited.
+
+**The lineup** can be passed on too: a row of squares, white where human was told from agent and red where it was not, without giving the answers away.
 
 ## Why something this simple works
 
@@ -234,6 +251,7 @@ The last section turns it on the visitor. You are the one human on the page, and
 - **The agent census is a floor, not an estimate.** An agent is a request that names itself as one, names nothing, or asks for a file only a scanner asks for. Agents that pass for a browser are not counted.
 - **Nothing personal is stored.** A human is a number, a signature and a hashed key. Connections are rate-limited by a salted hash, never by a stored address. [`/privacy`](https://medialockout.com/privacy) says so in plain words, and `forget me` in the terminal erases a human on request.
 - **The registry is defended in layers.** Cloudflare Turnstile on the last step; the three checks re-measured on the server (a line drawn at one speed is refused); a channel tied to the connection that opened it; per-connection and per-endpoint rate limits; a circuit breaker on new arrivals; and no write access for anything that announces itself as an agent.
+- **The cards are drawn by hand.** Each picture a link unfurls into is a 1200 by 630 PNG built in the Worker: a bitmap typeface of thirty-odd glyphs, rectangles, the standard compression stream, and a checksum. No image library, no stored files.
 - **Nodes are checked, not trusted.** Before listing a node, the Worker fetches the site's front page and looks for the node's line. It also tells the owner when the site's content security policy would stop browsers from loading it. The same client at the same node is counted once every few seconds, and the machine figure is a floor there too.
 - **The feed moderates itself, with an owner behind it.** Counted humans can report a transmission, and enough reports hide it until the owner reviews it at `/control`.
 - **Fonts** are loaded from Google Fonts.

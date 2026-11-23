@@ -252,3 +252,5 @@ html.ml-quiet { overflow: hidden; }
 .ml-net-open.more { padding-top: 16px; border-top: 1px solid var(--ml-line); }
 a.ml-btn { text-decoration: none; box-sizing: border-box; }
 .ml-net-open .ml-field { flex: 1 1 220px; width: auto; padding: 12px 14px; }
+
+.ml-net .ml-lede a { color: var(--ml-head); text-underline-offset: 4px; }

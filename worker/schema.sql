@@ -126,3 +126,12 @@ CREATE TABLE IF NOT EXISTS node_hits (
   hits    INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (node_id, day, name)
 );
+
+-- The chain: who brought whom. Written once, when a human who arrived through another human's
+-- record is counted.
+CREATE TABLE IF NOT EXISTS brought (
+  human_n INTEGER PRIMARY KEY,           -- the one who arrived
+  by_n    INTEGER NOT NULL,              -- the one whose record they arrived through
+  at      INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS brought_by ON brought (by_n);

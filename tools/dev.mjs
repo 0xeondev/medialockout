@@ -40,7 +40,7 @@ http.createServer(async (req, res) => {
   const request = new Request('http://' + req.headers.host + req.url, {
     method: req.method, headers, body: chunks.length ? Buffer.concat(chunks) : undefined,
   });
-  const env = { DB, ADMIN_KEY: process.env.ADMIN_KEY, MAX_HUMANS_PER_HOUR: process.env.MAX_HUMANS_PER_HOUR, BLOCKED_TERMS: process.env.BLOCKED_TERMS, LINEUP: process.env.LINEUP, NETWORK: process.env.NETWORK };
+  const env = { DB, ADMIN_KEY: process.env.ADMIN_KEY, MAX_HUMANS_PER_HOUR: process.env.MAX_HUMANS_PER_HOUR, BLOCKED_TERMS: process.env.BLOCKED_TERMS, LINEUP: process.env.LINEUP, NETWORK: process.env.NETWORK, CHAIN: process.env.CHAIN };
   // FAKE_SITES=<file.json> stands in for the open web when a node is checked: { "example.org": "<html>...</html>" }.
   // The file is read on every check, so a test can put a node's line into it after opening the node.
   if (process.env.FAKE_SITES) {

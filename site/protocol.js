@@ -24,6 +24,7 @@
     if (text != null) node.textContent = text;
     return node;
   }
+  var VIA = 'ml.via';
   function load(key) { try { return JSON.parse(localStorage.getItem(key) || 'null'); } catch (e) { return null; } }
   function save(key, value) { try { localStorage.setItem(key, JSON.stringify(value)); } catch (e) {} }
 
@@ -652,7 +653,16 @@
         'BROKEN ×' + (human.resets || 0)
       ];
       if (human.reignitions) facts.push('REIGNITED ×' + human.reignitions);
-      ctx.fillText(facts.join('   ·   '), 72, 352);
+      if (human.brought) facts.push('BROUGHT ' + human.brought);
+      // A long record is set smaller, never cut off.
+      var line = facts.join('   ·   ');
+      var size = 20;
+      while (size > 12 && ctx.measureText(line).width > W - 144) {
+        size -= 1;
+        ctx.font = '500 ' + size + 'px ' + mono;
+      }
+      ctx.fillText(line, 72, 352);
+      ctx.font = '500 20px ' + mono;
 
       // The signature: this human's deviation from a straight line.
       var left = 72;
@@ -691,8 +701,35 @@
     }
   }
 
-  function cardActions(canvas, human, closeLabel) {
+  // Hands words and a link to whatever the device shares with, or to the clipboard.
+  function shareOut(button, words, url) {
+    var label = button.textContent;
+    var said = function (text) {
+      button.textContent = text;
+      setTimeout(function () { button.textContent = label; }, 2600);
+    };
+    var copy = function () {
+      var full = words + (url ? ' ' + url : '');
+      if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(full).then(function () { said('Copied. Paste it anywhere'); }, function () { said('Could not copy'); });
+      else said('Could not copy');
+    };
+    if (navigator.share) {
+      var data = { text: words };
+      if (url) data.url = url;
+      navigator.share(data).then(function () {}, function (error) { if (!error || error.name !== 'AbortError') copy(); });
+    } else copy();
+  }
+
+  function cardActions(canvas, human, closeLabel, mine) {
     var row = el('div', 'ml-actions');
+    if (mine && !LOCAL) {
+      var share = el('button', 'ml-btn ml-btn-solid', 'Share');
+      share.type = 'button';
+      share.addEventListener('click', function () {
+        shareOut(share, 'I was counted. Human ' + pad(human.n) + ' on Media Lockout, the last network only humans can enter. Are you still human?', location.origin + '/h/' + human.n);
+      });
+      row.appendChild(share);
+    }
     var saveBtn = el('button', 'ml-btn', 'Save card');
     saveBtn.type = 'button';
     saveBtn.addEventListener('click', function () {
@@ -719,7 +756,7 @@
       });
       row.appendChild(copy);
     }
-    var close = el('button', 'ml-btn ml-btn-solid', closeLabel);
+    var close = el('button', 'ml-btn' + (mine && !LOCAL ? '' : ' ml-btn-solid'), closeLabel);
     close.type = 'button';
     close.addEventListener('click', closeChannel);
     row.appendChild(close);
@@ -818,6 +855,12 @@
     viewIntro();
   }
 
+  // The human whose record this visitor arrived through, if any, within the last thirty days.
+  function broughtBy() {
+    var via = LOCAL ? null : load(VIA);
+    return via && via.n > 0 && now() - via.at < 30 * 86400000 ? via.n : null;
+  }
+
   function viewIntro() {
     ch.data = { resets: 0 };
     var status = statusLine('');
@@ -845,14 +888,17 @@
         setStatus(status, error.message, 'r');
       });
     });
-    view(-1, [
+    var intro = [
       el('span', 'ml-step', 'Protocol H'),
       el('h2', null, 'The test you failed was written for machines.'),
       el('p', 'ml-lede', 'Every agent on this network passes it, every time. Failing is the first evidence. Three checks follow. None of them measures what you can do. They measure what you cannot help.'),
       actions,
       keeps,
       status
-    ]);
+    ];
+    var by = broughtBy();
+    if (by) intro.splice(4, 0, el('p', 'ml-note', 'Human ' + pad(by) + ' brought you here. If you are counted, that is recorded beside both numbers.'));
+    view(-1, intro);
     begin.focus({ preventScroll: true });
   }
 
@@ -1175,11 +1221,13 @@
       setStatus(status, 'transmitting...');
       api('/api/verify', {
         challenge: ch.data.challenge, silence_ms: ch.data.silence_ms, resets: ch.data.resets,
-        mode: ch.data.mode, points: ch.data.points, intervals: ch.data.intervals, answer: answer, ts: ch.data.ts || null
+        mode: ch.data.mode, points: ch.data.points, intervals: ch.data.intervals, answer: answer, ts: ch.data.ts || null,
+        via: broughtBy()
       }).then(function (res) {
         me = { token: res.token, human: res.human };
         known = true;
         save(KEY, me);
+        try { localStorage.removeItem(VIA); } catch (e) {}
         countdown = null;
         feedKey = null;
         applyState(res.state);
@@ -1229,10 +1277,10 @@
     drawCard(canvas, human);
     var lede = el('p', 'ml-lede ml-rise', 'You are the ' + ordinal(human.n) + ' human counted on this network.' + (res.reignited ? ' Your transmission reignited the signal.' : ''));
     lede.style.animationDelay = '3.2s';
-    var actions = cardActions(canvas, human, 'Return to the network');
+    var actions = cardActions(canvas, human, 'Return to the network', true);
     actions.classList.add('ml-rise');
     actions.style.animationDelay = '3.6s';
-    var note = el('p', 'ml-note ml-rise', 'Your key is kept on this device only. Clear it and the network will count you as gone.');
+    var note = el('p', 'ml-note ml-rise', (LOCAL ? '' : 'Every human counted through your link is recorded beside your number, and is one signal. ') + 'Your key is kept on this device only. Clear it and the network will count you as gone.');
     note.style.animationDelay = '3.6s';
     view(3, [el('span', 'ml-step', 'Result'), readout, title, canvas, lede, actions, note]);
   }
@@ -1242,16 +1290,43 @@
     openShell();
     var canvas = el('canvas', 'ml-card');
     drawCard(canvas, human);
-    var facts = 'Counted ' + stamp(human.issued_at) + ' · ' + plural(human.transmissions || 0, 'transmission', 'transmissions');
-    if (human.reignitions) facts += ' · reignited the signal ×' + human.reignitions;
+    var lede = el('p', 'ml-lede');
+    var tell = function () {
+      var facts = 'Counted ' + stamp(human.issued_at) + ' · ' + plural(human.transmissions || 0, 'transmission', 'transmissions');
+      if (human.reignitions) facts += ' · reignited the signal ×' + human.reignitions;
+      if (human.brought) facts += ' · brought ' + plural(human.brought, 'human', 'humans');
+      if (human.brought_by) facts += ' · brought by ' + pad(human.brought_by);
+      lede.textContent = facts;
+    };
+    tell();
+    var counted = !!(me && known);
+    var actions = cardActions(canvas, human, mine || counted ? 'Return to the network' : 'Look around first', mine);
     var nodes = [
       el('span', 'ml-step', mine ? 'Your record' : 'Record'),
       el('h2', null, 'Human ' + pad(human.n)),
       canvas,
-      el('p', 'ml-lede', facts),
-      cardActions(canvas, human, mine ? 'Return to the network' : 'Enter the network')
+      lede,
+      actions
     ];
-    if (mine) nodes.push(el('p', 'ml-note', 'Your key is kept on this device only. Clear it and the network will count you as gone.'));
+    if (mine) {
+      nodes.push(el('p', 'ml-note', (LOCAL ? '' : 'Every human counted through your link is recorded beside your number, and is one signal. ') + 'Your key is kept on this device only. Clear it and the network will count you as gone.'));
+      // The stored copy does not know who has arrived since.
+      if (!LOCAL) api('/api/human/' + human.n).then(function (fresh) {
+        human.brought = fresh.brought;
+        human.brought_by = fresh.brought_by;
+        human.transmissions = fresh.transmissions;
+        tell();
+        drawCard(canvas, human);
+      }, function () {});
+    } else if (!counted && !LOCAL) {
+      // A stranger looking at a human's record is asked the only question this node has.
+      var enter = el('button', 'ml-btn ml-btn-solid', 'Be counted');
+      enter.type = 'button';
+      enter.addEventListener('click', viewIntro);
+      actions.insertBefore(enter, actions.firstChild);
+      actions.lastChild.className = 'ml-btn';
+      nodes.splice(4, 0, el('p', 'ml-note', 'This human is still in the conversation. Are you?'));
+    }
     view(-1, nodes);
   }
 
@@ -1348,6 +1423,19 @@
         status.className = 'ml-note';
         status.textContent = 'You called ' + y.judged.correct + ' of ' + y.judged.total + ' correctly. Your signal: ' + (lineup.signal || 0) + '. A new lineup stands tomorrow.';
         lineupBody.appendChild(status);
+        if (!LOCAL) {
+          var tellRow = el('div', 'ml-actions');
+          var tellBtn = el('button', 'ml-btn', 'Share your call');
+          tellBtn.type = 'button';
+          tellBtn.addEventListener('click', function () {
+            // One square per answer: white where human was told from agent, red where it was not.
+            var kept = load('ml.marks');
+            var squares = (kept && kept.day === y.day && kept.marks ? kept.marks : []).map(function (right) { return right ? '\u2B1C' : '\uD83D\uDFE5'; }).join('');
+            shareOut(tellBtn, 'Media Lockout, the lineup: I told human from agent ' + y.judged.correct + ' of ' + y.judged.total + ' times.' + (squares ? '\n' + squares + '\n' : ' ') + 'Which of these is human?', location.origin + '/');
+          });
+          tellRow.appendChild(tellBtn);
+          lineupBody.appendChild(tellRow);
+        }
       } else if (counted) {
         var row = el('div', 'ml-actions');
         submit = el('button', 'ml-btn ml-btn-solid', 'Call it');
@@ -1357,6 +1445,8 @@
           submit.disabled = true;
           api('/api/lineup/judge', { token: me.token, calls: lineupCalls }).then(function (res) {
             y.judged = { correct: res.correct, total: res.total, reveal: res.reveal };
+            // Which calls were right is known only at this moment; keep it on this device for the share.
+            save('ml.marks', { day: y.day, marks: res.marks || [] });
             lineup.signal = res.signal;
             renderLineup();
             loadLineup();
@@ -1587,7 +1677,11 @@
     var limit = net.limit || 3;
     netBody.textContent = '';
 
-    netBody.appendChild(el('p', 'ml-lede', 'Any site can become a node. It carries one line of markup, and every machine that reads the site is counted here by the name it gives. Nothing about its visitors is kept. Only a counted human can open a node.'));
+    var lede = el('p', 'ml-lede', 'Any site can become a node. It carries one line of markup, and every machine that reads the site is counted here by the name it gives. Nothing about its visitors is kept. Only a counted human can open a node. ');
+    var how = el('a', null, 'How a node works');
+    how.href = '/join';
+    lede.appendChild(how);
+    netBody.appendChild(lede);
 
     var figs = el('div', 'ml-net-figs');
     [['Nodes beyond this one', net.totals.nodes], ['Machines counted there', net.totals.machines], ['Browsers seen there', net.totals.browsers]].forEach(function (f) {
@@ -1892,6 +1986,13 @@
   var record = location.pathname.match(/^\/h\/(\d{1,9})\/?$/);
   if (record) {
     if (me && known && me.human.n === Number(record[1])) openRecord(me.human, true);
-    else api('/api/human/' + record[1]).then(function (h) { openRecord(h, false); }, openMissing);
+    else {
+      // Arriving through a human's record is how the chain is drawn. The first one seen is the one kept.
+      if (!(me && known) && !LOCAL && !broughtBy()) save(VIA, { n: Number(record[1]), at: now() });
+      api('/api/human/' + record[1]).then(function (h) { openRecord(h, false); }, function () {
+        try { localStorage.removeItem(VIA); } catch (e) {}
+        openMissing();
+      });
+    }
   }
 })();

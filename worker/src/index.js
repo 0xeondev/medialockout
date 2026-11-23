@@ -253,7 +253,7 @@ const PROBES = [
 
 // Paths this node actually has. Anything else is shown without its text, so nobody
 // can write on the feed by requesting a sentence.
-const OWN_PATHS = new Set(['/', '/robots.txt', '/humans.txt', '/privacy', '/protocol.css', '/protocol.js', '/favicon.ico', '/sitemap.xml', '/api/state', '/api/agents', '/api/nodes']);
+const OWN_PATHS = new Set(['/', '/robots.txt', '/humans.txt', '/privacy', '/join', '/og.png', '/protocol.css', '/protocol.js', '/favicon.ico', '/sitemap.xml', '/api/state', '/api/agents', '/api/nodes']);
 
 function probePath(pathname) {
   for (const [pattern, shown] of PROBES) if (pattern.test(pathname)) return shown;
@@ -263,7 +263,7 @@ function probePath(pathname) {
 function classify(request, pathname) {
   const ua = request.headers.get('user-agent') || '';
   const probe = probePath(pathname);
-  const path = OWN_PATHS.has(pathname) || /^\/(h|n)\/\d{1,9}$/.test(pathname) ? pathname : probe || '';
+  const path = OWN_PATHS.has(pathname) || /^\/(h|n)\/\d{1,9}(\.png)?$/.test(pathname) ? pathname : probe || '';
   for (const [pattern, name, kind] of KNOWN_AGENTS) if (pattern.test(ua)) return { name, kind, path };
   if (!ua) return { name: 'nameless agent', kind: 'unidentified', path };
   if (/bot|crawl|spider/i.test(ua)) return { name: 'unnamed crawler', kind: 'crawler', path };
@@ -591,7 +591,8 @@ async function apiLineupJudge(env, request) {
   steps.push(env.DB.prepare('UPDATE lineup_judgements SET correct = ? WHERE day = ? AND human_n = ?').bind(correct, day, human.n));
   steps.push(env.DB.prepare('UPDATE humans SET signal = signal + ? WHERE n = ?').bind(correct, human.n));
   await env.DB.batch(steps);
-  return json({ correct, total: rows.length, reveal: reveal(rows), signal: human.signal + correct });
+  const marks = rows.map((r) => (calls[r.id] === 'human') === !!r.human_n);
+  return json({ correct, total: rows.length, marks, reveal: reveal(rows), signal: human.signal + correct });
 }
 
 /* ---------- the network ----------
@@ -985,8 +986,49 @@ async function adminNode(env, request) {
   return json({ ok: true });
 }
 
+// The page a site owner reads before joining: what the line does, what it does not, and how to add it.
+async function joinPage(env, url) {
+  const list = await nodesList(env);
+  const first = list.nodes.slice().sort((a, b) => a.id - b.id)[0];
+  const steps = [
+    'Be counted. Pass the human check on <a href="/">the front page</a>. It takes about a minute and asks for no account.',
+    'In section 06, name a site you can edit and copy its line.',
+    'Put the line anywhere in the body of that site\'s front page, then press Check the site. The node is listed once the line is found there.',
+  ];
+  const items = [
+    ['What you add', 'One line of HTML: a link and a script of about one kilobyte, loaded after your page. It draws a small badge with your node\'s number and its count.'],
+    ['What happens then', 'Each client that loads the line is counted here: as a machine, by the name it announces (GPTBot, ClaudeBot, a headless browser), or as a browser. Your node gets a public page with its own record' + (first ? ', like <a href="/n/' + first.id + '">' + esc(nodeName(first.id)) + ', ' + esc(first.host) + '</a>.' : '.')],
+    ['What it does not do', 'It sets no cookie and takes no fingerprint. It reads nothing from your page. No address and no page address is stored, only daily totals. The script is short enough to read in full, and <a href="https://github.com/0xeondev/medialockout" rel="noopener">its source is public</a>.'],
+    ['What the number means', 'The machine count is a floor. A machine that passes for a browser without running the page is not counted, and the same client is counted at most once every few seconds.'],
+    ['If your site sends a content security policy', 'Allow ' + esc(url.origin) + ' under script-src and img-src. The check tells you if the policy is in the way.'],
+    ['Leaving', 'Remove the line and close the node in section 06. Its count is erased.'],
+  ];
+  const body =
+    '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">' +
+    '<title>Make your site a node — Media Lockout</title><meta name="description" content="One line of HTML, and the machines that read your site are counted in public. No cookies, no addresses.">' +
+    linkTags(url.origin + '/join', 'Make your site a node', 'One line of HTML, and the machines that read your site are counted in public.', url.origin + '/og.png') +
+    '<style>body{margin:0;padding:56px 24px 80px;background:#0a0b0d;color:#a6abb3;font:16px/1.7 ui-monospace,Menlo,Consolas,monospace}' +
+    'main{max-width:680px;margin:0 auto}small{display:block;font-size:12px;letter-spacing:.24em;text-transform:uppercase;color:#d6453d}' +
+    'h1{margin:14px 0 20px;font:400 clamp(30px,6vw,52px)/1.05 "Arial Black",Arial,sans-serif;color:#eceef1}.lede{margin:0 0 36px;font-size:18px;color:#c9ccd1}' +
+    'dl{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:1px;margin:0 0 12px;background:#1c1f24;border:1px solid #1c1f24;border-radius:4px;overflow:hidden}' +
+    'dl div{padding:18px;background:#0e1013}dt{font-size:11px;letter-spacing:.2em;text-transform:uppercase;color:#8a9099}' +
+    'dd{margin:8px 0 0;font:400 30px/1 "Arial Black",Arial,sans-serif;color:#eceef1;font-variant-numeric:tabular-nums}' +
+    'h2{margin:32px 0 6px;font-size:13px;font-weight:500;letter-spacing:.18em;text-transform:uppercase;color:#eceef1}p{margin:0}ol{margin:0;padding-left:22px}li{margin:0 0 8px;padding-left:4px}' +
+    '.go{display:inline-block;margin-top:36px;padding:14px 20px;border:1px solid #eceef1;border-radius:4px;background:#eceef1;color:#0a0b0d;font-size:12px;font-weight:500;letter-spacing:.18em;text-transform:uppercase;text-decoration:none}' +
+    'a{color:#c9ccd1}footer{margin-top:56px;padding-top:24px;border-top:1px solid #1c1f24;font-size:13px;color:#8a9099}</style></head><body><main>' +
+    '<small>Media Lockout // the network</small><h1>Make your site a node</h1>' +
+    '<p class="lede">Machines read your site every day. Some of them say so. A node counts the ones that do, in public.</p>' +
+    '<dl><div><dt>Nodes so far</dt><dd>' + figure(list.totals.nodes) + '</dd></div><div><dt>Machines counted there</dt><dd>' + figure(list.totals.machines) + '</dd></div>' +
+    '<div><dt>Browsers seen there</dt><dd>' + figure(list.totals.browsers) + '</dd></div></dl>' +
+    '<h2>How to join</h2><ol>' + steps.map((s) => '<li>' + s + '</li>').join('') + '</ol>' +
+    items.map((i) => '<h2>' + i[0] + '</h2><p>' + i[1] + '</p>').join('') +
+    '<a class="go" href="/">Go to the front page</a>' +
+    '<footer><p><a href="/">return to node 00</a> · <a href="/privacy">what is kept</a></p></footer></main></body></html>';
+  return new Response(body, { headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'public, max-age=60', 'x-content-type-options': 'nosniff' } });
+}
+
 // A node's own page: what was counted there, and nothing that was not.
-async function nodePage(env, id) {
+async function nodePage(env, id, url) {
   const node = await env.DB.prepare('SELECT id, host, human_n, verified_at, last_seen FROM nodes WHERE id = ? AND verified_at IS NOT NULL').bind(id).first();
   if (!node) return notFoundPage();
   const [names, days] = await env.DB.batch([
@@ -1008,7 +1050,7 @@ async function nodePage(env, id) {
   const body =
     '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">' +
     '<title>' + esc(title) + ' — Media Lockout</title><meta name="description" content="' + esc(about) + '">' +
-    '<meta property="og:title" content="' + esc(title) + '"><meta property="og:description" content="' + esc(about) + '">' +
+    linkTags(url.origin + '/n/' + node.id, title, about, url.origin + '/n/' + node.id + '.png') +
     '<style>body{margin:0;padding:56px 24px 80px;background:#0a0b0d;color:#a6abb3;font:15px/1.7 ui-monospace,Menlo,Consolas,monospace}' +
     'main{max-width:720px;margin:0 auto}small{display:block;font-size:12px;letter-spacing:.24em;text-transform:uppercase;color:#d6453d}' +
     'h1{margin:14px 0 6px;font:400 clamp(34px,7vw,64px)/1.02 "Arial Black",Arial,sans-serif;color:#eceef1}' +
@@ -1036,6 +1078,273 @@ async function nodePage(env, id) {
     '<h2>What is counted</h2><p>Every client that loads this node\'s line. A machine is counted by the name it announces. One that passes for a browser without running the page is not counted, so the machine figure is a floor. The same client is counted at most once every few seconds. No address is kept.</p>' +
     '<footer><p><a href="/">return to node 00</a> · <a href="/privacy">what is kept</a></p></footer></main></body></html>';
   return new Response(body, { headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'public, max-age=60', 'x-content-type-options': 'nosniff' } });
+}
+
+/* ---------- cards ----------
+   A link to this node should show what the node knows. These are the pictures a link unfurls into:
+   the live count, a human's record, a node's record. They are drawn here, pixel by pixel, from the
+   database, and encoded as PNG without a library. Nothing in them is decoration over a guess. */
+
+const GLYPHS = {};
+(
+  'A01110100011000111111100011000110001 B11110100011000111110100011000111110 C01110100011000010000100001000101110 ' +
+  'D11110100011000110001100011000111110 E11111100001000011110100001000011111 F11111100001000011110100001000010000 ' +
+  'G01110100011000010111100011000101111 H10001100011000111111100011000110001 I11111001000010000100001000010011111 ' +
+  'J00111000100001000010000101001001100 K10001100101010011000101001001010001 L10000100001000010000100001000011111 ' +
+  'M10001110111010110101100011000110001 N10001110011010110011100011000110001 O01110100011000110001100011000101110 ' +
+  'P11110100011000111110100001000010000 Q01110100011000110001101011001001101 R11110100011000111110101001001010001 ' +
+  'S01111100001000001110000010000111110 T11111001000010000100001000010000100 U10001100011000110001100011000101110 ' +
+  'V10001100011000110001100010101000100 W10001100011000110101101011101110001 X10001100010101000100010101000110001 ' +
+  'Y10001100010101000100001000010000100 Z11111000010001000100010001000011111 ' +
+  '001110100011001110101110011000101110 100100011000010000100001000010001110 201110100010000100010001000100011111 ' +
+  '311110000010000101110000010000111110 400010001100101010010111110001000010 511111100001111000001000011000101110 ' +
+  '600110010001000011110100011000101110 711111000010001000100010000100001000 801110100011000101110100011000101110 ' +
+  '901110100011000101111000010001001100 #01010010101111101010111110101001010 .00000000000000000000000000110001100 ' +
+  ',00000000000000000000011000010001000 :00000011000110000000011000110000000 /00001000010001000100010001000010000 ' +
+  '-00000000000000011111000000000000000 %11000110010001000100010001001100011 ?01110100010000100010001000000000100 ' +
+  '·00000000000000001100011000000000000'
+)
+  .split(' ')
+  .forEach((g) => {
+    GLYPHS[g[0]] = g.slice(1);
+  });
+
+const INK = { bg: 0, panel: 1, line: 2, muted: 3, text: 4, head: 5, red: 6 };
+const PALETTE = [0x0a, 0x0b, 0x0d, 0x0e, 0x10, 0x13, 0x2a, 0x2e, 0x34, 0x8a, 0x90, 0x99, 0xc9, 0xcc, 0xd1, 0xec, 0xee, 0xf1, 0xd6, 0x45, 0x3d];
+const CARD_W = 1200;
+const CARD_H = 630;
+
+// One byte per pixel, plus the leading filter byte PNG wants on every row. Index 0 is the background.
+function sheet() {
+  return new Uint8Array((CARD_W + 1) * CARD_H);
+}
+
+function rect(px, x, y, w, h, ink) {
+  x = Math.round(x);
+  y = Math.round(y);
+  const x1 = Math.min(CARD_W, x + Math.round(w));
+  const y1 = Math.min(CARD_H, y + Math.round(h));
+  const x0 = Math.max(0, x);
+  for (let row = Math.max(0, y); row < y1; row += 1) {
+    const at = row * (CARD_W + 1) + 1;
+    if (x1 > x0) px.fill(ink, at + x0, at + x1);
+  }
+}
+
+const widthOf = (words, scale) => (words.length ? words.length * 6 * scale - scale : 0);
+
+// The largest whole scale at which the words fit.
+function fit(words, most, room) {
+  let scale = most;
+  while (scale > 2 && widthOf(words, scale) > room) scale -= 1;
+  return scale;
+}
+
+function write(px, words, x, y, scale, ink, align) {
+  words = String(words).toUpperCase();
+  if (align === 'right') x -= widthOf(words, scale);
+  for (const letter of words) {
+    const glyph = GLYPHS[letter];
+    if (glyph) {
+      for (let row = 0; row < 7; row += 1) {
+        for (let col = 0; col < 5; col += 1) {
+          if (glyph[row * 5 + col] !== '1') continue;
+          let run = 1;
+          while (col + run < 5 && glyph[row * 5 + col + run] === '1') run += 1;
+          rect(px, x + col * scale, y + row * scale, run * scale, scale, ink);
+          col += run - 1;
+        }
+      }
+    }
+    x += 6 * scale;
+  }
+}
+
+function frame(px, left, right) {
+  rect(px, 28, 28, CARD_W - 56, 2, INK.line);
+  rect(px, 28, CARD_H - 30, CARD_W - 56, 2, INK.line);
+  rect(px, 28, 28, 2, CARD_H - 56, INK.line);
+  rect(px, CARD_W - 30, 28, 2, CARD_H - 56, INK.line);
+  write(px, left, 72, 74, 3, INK.muted);
+  write(px, right, CARD_W - 72, 74, 3, INK.head, 'right');
+  rect(px, CARD_W - 72 - widthOf(right, 3) - 34, 76, 16, 16, INK.red);
+}
+
+let crcTable = null;
+function crc32(bytes) {
+  if (!crcTable) {
+    crcTable = new Uint32Array(256);
+    for (let n = 0; n < 256; n += 1) {
+      let c = n;
+      for (let k = 0; k < 8; k += 1) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+      crcTable[n] = c >>> 0;
+    }
+  }
+  let crc = 0xffffffff;
+  for (let i = 0; i < bytes.length; i += 1) crc = crcTable[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function chunk(type, data) {
+  const out = new Uint8Array(12 + data.length);
+  const view = new DataView(out.buffer);
+  view.setUint32(0, data.length);
+  for (let i = 0; i < 4; i += 1) out[4 + i] = type.charCodeAt(i);
+  out.set(data, 8);
+  view.setUint32(8 + data.length, crc32(out.subarray(4, 8 + data.length)));
+  return out;
+}
+
+async function png(px) {
+  const stream = new CompressionStream('deflate');
+  const writer = stream.writable.getWriter();
+  writer.write(px);
+  writer.close();
+  const packed = new Uint8Array(await new Response(stream.readable).arrayBuffer());
+  const head = new Uint8Array(13);
+  const view = new DataView(head.buffer);
+  view.setUint32(0, CARD_W);
+  view.setUint32(4, CARD_H);
+  head[8] = 8;   // bit depth
+  head[9] = 3;   // indexed colour
+  const parts = [new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]), chunk('IHDR', head), chunk('PLTE', new Uint8Array(PALETTE)), chunk('IDAT', packed), chunk('IEND', new Uint8Array(0))];
+  const out = new Uint8Array(parts.reduce((sum, p) => sum + p.length, 0));
+  let at = 0;
+  for (const part of parts) {
+    out.set(part, at);
+    at += part.length;
+  }
+  return out;
+}
+
+const picture = (bytes, seconds) =>
+  new Response(bytes, { headers: { 'content-type': 'image/png', 'cache-control': 'public, max-age=' + seconds, 'x-content-type-options': 'nosniff', 'cross-origin-resource-policy': 'cross-origin' } });
+
+// A card is drawn once and then served from the edge until it goes stale.
+async function drawnOnce(request, ctx, draw) {
+  const store = typeof caches !== 'undefined' && caches.default;
+  if (store) {
+    const kept = await store.match(request.url).catch(() => null);
+    if (kept) return kept;
+  }
+  const response = await draw();
+  if (store && response.status === 200 && ctx && ctx.waitUntil) ctx.waitUntil(store.put(request.url, response.clone()).catch(() => {}));
+  return response;
+}
+
+// The live count: what a link to the front page shows.
+async function countCard(env) {
+  const state = await getState(env);
+  const px = sheet();
+  frame(px, 'MEDIA LOCKOUT // NODE 00', 'LIVE COUNT');
+  const humans = figure(state.total);
+  const agents = figure(state.agents.seen);
+  write(px, 'HUMANS COUNTED', 72, 168, 3, INK.muted);
+  write(px, humans, 72, 212, fit(humans, 22, 470), INK.head);
+  write(px, 'AGENTS COUNTED', 640, 168, 3, INK.muted);
+  write(px, agents, 640, 212, fit(agents, 22, 488), INK.red);
+  rect(px, 72, 430, CARD_W - 144, 2, INK.line);
+  write(px, 'THE LAST NETWORK ONLY HUMANS CAN ENTER.', 72, 466, 4, INK.head);
+  write(px, 'MEDIALOCKOUT.COM', 72, 540, 3, INK.muted);
+  write(px, 'ARE YOU STILL HUMAN?', CARD_W - 72, 540, 3, INK.red, 'right');
+  return picture(await png(px), 600);
+}
+
+// A human's record, with the line they drew.
+async function humanCard(env, n) {
+  const row = await env.DB.prepare('SELECT n, issued_at, mode, tremor, silence_ms, resets, sig, reignitions FROM humans WHERE n = ?').bind(n).first();
+  if (!row) return notFoundPage();
+  const px = sheet();
+  frame(px, 'MEDIA LOCKOUT // NODE 00', 'VERIFIED HUMAN');
+  const name = pad(row.n);
+  write(px, name, 72, 136, fit(name, 24, 1000), INK.head);
+  const facts = [(row.mode === 'rhythm' ? 'DRIFT ' : 'TREMOR ') + Number(row.tremor).toFixed(2) + '%', 'SILENCE ' + (row.silence_ms / 1000).toFixed(1) + ' S', 'BROKEN X' + (row.resets || 0)];
+  if (row.reignitions) facts.push('REIGNITED X' + row.reignitions);
+  if (chainOn(env)) {
+    const brought = await env.DB.prepare('SELECT COUNT(*) AS v FROM brought WHERE by_n = ?').bind(n).first('v');
+    if (brought) facts.push('BROUGHT ' + brought);
+  }
+  const line = facts.join('  ·  ');
+  write(px, line, 72, 336, fit(line, 3, CARD_W - 144), INK.muted);
+
+  // The signature: this human's deviation from a straight line.
+  let sig = [];
+  try {
+    sig = JSON.parse(row.sig);
+  } catch {}
+  if (!Array.isArray(sig) || sig.length < 2) sig = [0, 0];
+  const left = 72;
+  const right = CARD_W - 72;
+  const mid = 448;
+  rect(px, left, mid, right - left, 2, INK.line);
+  let last = null;
+  for (let x = left; x <= right; x += 1) {
+    const at = ((x - left) / (right - left)) * (sig.length - 1);
+    const i = Math.min(sig.length - 2, Math.floor(at));
+    const v = Number(sig[i]) + (Number(sig[i + 1]) - Number(sig[i])) * (at - i);
+    const y = Math.max(380, Math.min(516, mid - (Number.isFinite(v) ? v : 0) * 56));
+    const top = last === null ? y : Math.min(last, y);
+    rect(px, x, top - 2, 1, Math.abs((last === null ? y : last) - y) + 4, INK.red);
+    last = y;
+  }
+  write(px, 'COUNTED ' + new Date(row.issued_at).toISOString().slice(0, 10), 72, 548, 3, INK.muted);
+  write(px, 'MEDIALOCKOUT.COM/H/' + row.n, CARD_W - 72, 548, 3, INK.head, 'right');
+  return picture(await png(px), 600);
+}
+
+// A node's record: the site, and what was counted there.
+async function nodeCard(env, id) {
+  const node = await env.DB.prepare('SELECT id, host FROM nodes WHERE id = ? AND verified_at IS NOT NULL').bind(id).first();
+  if (!node) return notFoundPage();
+  const sums = await env.DB.prepare(
+    "SELECT COALESCE(SUM(CASE WHEN name != '' THEN hits ELSE 0 END), 0) AS machines, COALESCE(SUM(CASE WHEN name = '' THEN hits ELSE 0 END), 0) AS browsers FROM node_hits WHERE node_id = ?"
+  ).bind(id).first();
+  const px = sheet();
+  frame(px, 'MEDIA LOCKOUT // THE NETWORK', nodeName(node.id));
+  write(px, node.host, 72, 140, fit(node.host, 10, CARD_W - 144), INK.head);
+  const machines = figure(sums.machines);
+  const browsers = figure(sums.browsers);
+  write(px, 'MACHINES COUNTED', 72, 262, 3, INK.muted);
+  write(px, machines, 72, 300, fit(machines, 16, 470), INK.red);
+  write(px, 'BROWSERS SEEN', 640, 262, 3, INK.muted);
+  write(px, browsers, 640, 300, fit(browsers, 16, 488), INK.head);
+  rect(px, 72, 452, CARD_W - 144, 2, INK.line);
+  write(px, 'THIS SITE COUNTS THE MACHINES THAT READ IT.', 72, 486, 3, INK.head);
+  write(px, 'MEDIALOCKOUT.COM/N/' + node.id, 72, 548, 3, INK.muted);
+  write(px, 'COUNT YOURS', CARD_W - 72, 548, 3, INK.red, 'right');
+  return picture(await png(px), 600);
+}
+
+// The tags that tell another site how to show a link to this one.
+function linkTags(url, title, about, image) {
+  return (
+    '<meta property="og:type" content="website"><meta property="og:site_name" content="Media Lockout">' +
+    '<meta property="og:title" content="' + esc(title) + '"><meta property="og:description" content="' + esc(about) + '">' +
+    '<meta property="og:url" content="' + esc(url) + '"><meta property="og:image" content="' + esc(image) + '">' +
+    '<meta property="og:image:width" content="' + CARD_W + '"><meta property="og:image:height" content="' + CARD_H + '">' +
+    '<meta name="twitter:card" content="summary_large_image"><meta name="twitter:title" content="' + esc(title) + '">' +
+    '<meta name="twitter:description" content="' + esc(about) + '"><meta name="twitter:image" content="' + esc(image) + '">'
+  );
+}
+
+/* ---------- the chain ----------
+   A human who arrives through another human's record, and is counted, was brought by them.
+   It is written once, it is public, and it is worth one signal to whoever did the bringing. */
+
+const chainOn = (env) => String(env.CHAIN || '') === 'on';
+
+async function recordBringer(env, newN, via, ip) {
+  if (!chainOn(env)) return null;
+  const by = Number(via);
+  if (!Number.isInteger(by) || by < 1 || by === newN) return null;
+  const bringer = await env.DB.prepare('SELECT n, ip_hash FROM humans WHERE n = ?').bind(by).first();
+  // Nobody brings themselves: an arrival from the bringer's own connection is counted, but not credited.
+  if (!bringer || bringer.ip_hash === ip) return null;
+  await env.DB.batch([
+    env.DB.prepare('INSERT OR IGNORE INTO brought (human_n, by_n, at) VALUES (?, ?, ?)').bind(newN, by, Date.now()),
+    env.DB.prepare('UPDATE humans SET signal = signal + 1 WHERE n = ?').bind(by),
+  ]);
+  return by;
 }
 
 /* ---------- shared state ---------- */
@@ -1201,11 +1510,14 @@ async function apiVerify(env, request) {
     .bind(await sha256(token), now, now, mode, read.tremor, Math.min(Math.round(silence), 600000), resets, JSON.stringify(read.sig), ip)
     .first();
   const reignited = await transmit(env, row.n, cleaned.text, now);
+  const broughtBy = await recordBringer(env, row.n, body.via, ip).catch(() => null);
 
   return json({
     token,
     human: {
       n: row.n,
+      brought_by: broughtBy,
+      brought: 0,
       issued_at: now,
       mode,
       tremor: read.tremor,
@@ -1287,6 +1599,7 @@ async function apiForget(env, request) {
     env.DB.prepare('DELETE FROM humans WHERE n = ?').bind(human.n),
   ]);
   if (networkOn(env)) await closeNodesOf(env, human.n);
+  if (chainOn(env)) await env.DB.prepare('DELETE FROM brought WHERE human_n = ? OR by_n = ?').bind(human.n, human.n).run();
   stateMemo.at = 0;
   return json({ forgotten: true, state: await getState(env, true) });
 }
@@ -1330,6 +1643,7 @@ async function adminHuman(env, request) {
     env.DB.prepare('DELETE FROM humans WHERE n = ?').bind(n),
   ]);
   if (networkOn(env)) await closeNodesOf(env, n);
+  if (chainOn(env)) await env.DB.prepare('DELETE FROM brought WHERE human_n = ? OR by_n = ?').bind(n, n).run();
   stateMemo.at = 0;
   return json({ ok: true });
 }
@@ -1382,6 +1696,7 @@ function privacyPage() {
     ['Reports', 'A counted human can report a transmission. Enough reports hide it until it is reviewed.'],
     ['The lineup', 'Where the lineup is open, a counted human may answer the day\'s question. The answer is stored with their number, shown the next day without it, and labelled once a human has called it. The resident agents\' answers are written by a model run on Cloudflare Workers AI; nothing a human wrote is sent to it.'],
     ['Nodes', 'A counted human can make another site a node by placing one line on it. From a visitor of that site this node receives one request per page. It is counted as a machine, by the name it announces, or as a browser, and only the daily totals are kept: no address, no page, no cookie. The site\'s address and the number of the human who opened it are public. Erasing a human closes their nodes.'],
+    ['The chain', 'If you open another human\'s record and are then counted, the node records that they brought you. Both numbers show it, and it is worth one signal to them. Being forgotten erases it.'],
     ['To be forgotten', 'Type "forget me" in the diagnostics terminal. Your number, measurements and transmissions are deleted. The number is not issued again.'],
   ];
   const body =
@@ -1411,7 +1726,16 @@ async function apiHuman(env, n) {
   try {
     sig = JSON.parse(row.sig);
   } catch {}
-  return json({ ...row, sig });
+  const chain = {};
+  if (chainOn(env)) {
+    const [mine, theirs] = await env.DB.batch([
+      env.DB.prepare('SELECT by_n FROM brought WHERE human_n = ?').bind(n),
+      env.DB.prepare('SELECT COUNT(*) AS v FROM brought WHERE by_n = ?').bind(n),
+    ]);
+    chain.brought_by = mine.results[0] ? mine.results[0].by_n : null;
+    chain.brought = theirs.results[0] ? theirs.results[0].v : 0;
+  }
+  return json({ ...row, sig, ...chain });
 }
 
 /* ---------- pages and plain-text files ---------- */
@@ -1477,7 +1801,7 @@ function notFoundPage() {
   return new Response(body, { status: 404, headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' } });
 }
 
-async function page(env, humanN) {
+async function page(env, humanN, url) {
   let html = ASSETS.html.replace('<head>', '<head><base href="/">');
   let status = 200;
   if (humanN) {
@@ -1495,8 +1819,7 @@ async function page(env, humanN) {
       .replace(
         /<meta name="description" content="[^"]*">/,
         '<meta name="description" content="Counted on node 00. One of the humans still in the conversation.">' +
-          '<meta property="og:title" content="' + title + '">' +
-          '<meta property="og:description" content="Counted on node 00. One of the humans still in the conversation.">'
+          linkTags(url.origin + '/h/' + humanN, 'Human ' + pad(humanN) + ' was counted', 'One of the humans still in the conversation. Are you?', url.origin + '/h/' + humanN + '.png')
       );
   }
   const headers = {
@@ -1507,6 +1830,10 @@ async function page(env, humanN) {
   };
   try {
     const state = await getState(env);
+    if (!humanN) {
+      const about = figure(state.total) + (state.total === 1 ? ' human counted. ' : ' humans counted. ') + figure(state.agents.seen) + ' agents counted. The last network only humans can enter.';
+      html = html.replace('</title>', '</title>' + linkTags(url.origin + '/', 'Media Lockout \u2014 The Silence Behind the Signal', about, url.origin + '/og.png'));
+    }
     headers['x-human-signal'] = signalOf(state);
     headers['x-humans-counted'] = String(state.total);
     headers['x-agents-counted'] = String(state.agents.seen);
@@ -1597,17 +1924,23 @@ async function route(request, env, ctx) {
   }
 
   if (method !== 'GET' && method !== 'HEAD') return new Response('method not allowed', { status: 405 });
-  if (path === '/' || path === '/index.html') return page(env, 0);
+  if (path === '/' || path === '/index.html') return page(env, 0, url);
   if (path === '/protocol.css') return asset(ASSETS.css, 'text/css; charset=utf-8');
   if (path === '/protocol.js') return asset(ASSETS.js, 'text/javascript; charset=utf-8');
   if (path === '/robots.txt') return robotsTxt();
   if (path === '/humans.txt') return humansTxt(env);
   if (path === '/privacy') return privacyPage();
+  if (path === '/join' && networkOn(env)) return joinPage(env, url);
   if (path === '/control') return controlPage();
   const h = path.match(/^\/h\/(\d{1,9})$/);
-  if (h && Number(h[1]) > 0) return page(env, Number(h[1]));
+  if (h && Number(h[1]) > 0) return page(env, Number(h[1]), url);
+  if (path === '/og.png') return drawnOnce(request, ctx, () => countCard(env));
+  const hc = path.match(/^\/h\/(\d{1,9})\.png$/);
+  if (hc && Number(hc[1]) > 0) return drawnOnce(request, ctx, () => humanCard(env, Number(hc[1])));
+  const nc = path.match(/^\/n\/(\d{1,9})\.png$/);
+  if (nc && networkOn(env)) return drawnOnce(request, ctx, () => nodeCard(env, Number(nc[1])));
   const n = path.match(/^\/n\/(\d{1,9})$/);
-  if (n && networkOn(env)) return nodePage(env, Number(n[1]));
+  if (n && networkOn(env)) return nodePage(env, Number(n[1]), url);
   return notFoundPage();
 }
 
